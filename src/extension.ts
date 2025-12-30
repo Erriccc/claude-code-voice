@@ -9,7 +9,14 @@ import { VoicePopupServer } from './voice-popup-server';
 import { VoiceRecorder } from './voice-recorder';
 
 // Use sound-play for native audio playback (bypasses webview autoplay restrictions)
-const soundPlay = require('sound-play');
+// Wrapped in try-catch for platforms where native module fails
+let soundPlay: any = null;
+try {
+    soundPlay = require('sound-play');
+    console.log('sound-play loaded successfully');
+} catch (err) {
+    console.log('sound-play not available (native module), TTS playback disabled:', err);
+}
 
 const exec = util.promisify(cp.exec);
 
@@ -322,33 +329,44 @@ class ClaudeChatProvider {
 				console.log('Got audio buffer, size:', audioBuffer.length);
 
 				// Play audio NATIVELY via Node.js - bypasses webview autoplay restrictions!
-				// Write to temp file and play with sound-play
-				const tempFile = path.join(os.tmpdir(), `claude-tts-${Date.now()}.mp3`);
-				fs.writeFileSync(tempFile, audioBuffer);
-				console.log('Wrote audio to temp file:', tempFile);
+				if (soundPlay) {
+					// Write to temp file and play with sound-play
+					const tempFile = path.join(os.tmpdir(), `claude-tts-${Date.now()}.mp3`);
+					fs.writeFileSync(tempFile, audioBuffer);
+					console.log('Wrote audio to temp file:', tempFile);
 
-				try {
-					console.log('Playing audio natively via sound-play...');
-					await soundPlay.play(tempFile);
-					console.log('Audio playback completed!');
-				} catch (playError) {
-					console.error('Native audio playback failed:', playError);
-					// Fallback: send to webview (user will need to click play button)
+					try {
+						console.log('Playing audio natively via sound-play...');
+						await soundPlay.play(tempFile);
+						console.log('Audio playback completed!');
+					} catch (playError) {
+						console.error('Native audio playback failed:', playError);
+						// Fallback: send to webview (user will need to click play button)
+						const base64Audio = audioBuffer.toString('base64');
+						this._postMessage({
+							type: 'playAudio',
+							audio: base64Audio,
+							mimeType: 'audio/mp3'
+						});
+						console.log('Fell back to webview playback');
+					} finally {
+						// Clean up temp file
+						try {
+							fs.unlinkSync(tempFile);
+							console.log('Cleaned up temp file');
+						} catch (e) {
+							// Ignore cleanup errors
+						}
+					}
+				} else {
+					// sound-play not available, use webview fallback
+					console.log('sound-play not available, using webview playback');
 					const base64Audio = audioBuffer.toString('base64');
 					this._postMessage({
 						type: 'playAudio',
 						audio: base64Audio,
 						mimeType: 'audio/mp3'
 					});
-					console.log('Fell back to webview playback');
-				} finally {
-					// Clean up temp file
-					try {
-						fs.unlinkSync(tempFile);
-						console.log('Cleaned up temp file');
-					} catch (e) {
-						// Ignore cleanup errors
-					}
 				}
 			} else {
 				console.log('No audio buffer returned from TTS');

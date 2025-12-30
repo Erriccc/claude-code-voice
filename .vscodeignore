@@ -2,6 +2,8 @@
 .vscode-test/**
 src/**
 .gitignore
+.env
+.env.*
 .yarnrc
 vsc-extension-quickstart.md
 **/tsconfig.json
@@ -12,6 +14,8 @@ vsc-extension-quickstart.md
 backup
 .claude
 claude-code-chat-permissions-mcp/**
-node_modules
 mcp-permissions.js
 build
+# Keep node_modules - needed for native modules (audify, sound-play)
+node_modules/.cache
+node_modules/.package-lock.json
