@@ -1,0 +1,24 @@
+out/
+dist/
+node_modules/
+.vscode-test/
+*.vsix
+backup/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local
+
+# Native build artifacts
+build/
+prebuilds/
+
+# Claude Code local settings
+.claude/
