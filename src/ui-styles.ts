@@ -1570,6 +1570,30 @@ const styles = `
         50% { opacity: 0.5; }
     }
 
+    .browser-voice-btn {
+        background-color: transparent;
+        color: var(--vscode-foreground);
+        border: none;
+        padding: 4px;
+        border-radius: 4px;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 24px;
+        height: 24px;
+        transition: all 0.2s ease;
+    }
+
+    .browser-voice-btn:hover {
+        background-color: var(--vscode-list-hoverBackground);
+        color: #64ffda;
+    }
+
+    .browser-voice-btn.connected {
+        color: #64ffda;
+    }
+
     .tts-play-btn {
         background-color: rgba(76, 175, 80, 0.15);
         color: #4CAF50;

@@ -154,8 +154,85 @@ claude-code-voice/
 | macOS | ✅ Native (CoreAudio) | ✅ afplay | ✅ |
 | Windows | ✅ Native (WASAPI) | ✅ PowerShell | ✅ |
 | Linux | ✅ Native (ALSA/PulseAudio) | ✅ aplay | ✅ |
-| Codespaces | ⚠️ Browser popup | ✅ | ✅ |
-| VS Code Web | ⚠️ Browser popup | ⚠️ Limited | ✅ |
+| Codespaces | ✅ Persistent Browser Mode | ✅ Browser | ✅ |
+| VS Code Web | ✅ Persistent Browser Mode | ✅ Browser | ✅ |
+
+---
+
+## Persistent Browser Voice Mode (v1.1.0+)
+
+For environments where native audio isn't available (Codespaces, VS Code Web), we offer a **Persistent Browser Voice Mode** that keeps a browser tab open for continuous voice interaction.
+
+### How It Works
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         VS Code Extension                                │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  VoiceBridgeServer (WebSocket)                                   │    │
+│  │  • Generates 6-digit session code                                │    │
+│  │  • Manages WebSocket connections                                 │    │
+│  │  • Routes audio/transcripts between browser and Claude          │    │
+│  │  • Session expires after 30 min inactivity                      │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                              ↕ WebSocket                                 │
+└─────────────────────────────────────────────────────────────────────────┘
+                               ↕ WSS (secure)
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         Browser Tab (stays open)                         │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  Voice Interface                                                 │    │
+│  │  • Enter session code to connect                                │    │
+│  │  • Mic recording via getUserMedia                               │    │
+│  │  • Audio playback for TTS responses                             │    │
+│  │  • Real-time transcript display                                 │    │
+│  │  • Push-to-talk or voice-activated                              │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### User Flow
+
+1. **In VS Code**: Click the "Browser Voice Mode" button in the webview
+2. **Extension**: Generates a 6-digit session code (e.g., `A3F9K2`)
+3. **Extension**: Opens browser to voice page OR displays QR code
+4. **In Browser**: Enter the session code to connect
+5. **Connected**: Browser shows "Connected to VS Code"
+6. **Voice Chat**: Click mic to talk → see transcript → hear response
+7. **Continuous**: Tab stays open for ongoing conversation
+
+### Security
+
+- **Session Code**: 6-char alphanumeric, valid for 5 minutes before first connection
+- **Session Token**: After connection, uses secure token for authentication
+- **WSS**: All WebSocket traffic is encrypted (wss:// in production)
+- **Auto-Expire**: Sessions expire after 30 minutes of inactivity
+- **Codespaces**: Leverages GitHub's built-in port forwarding security
+
+### WebSocket Message Types
+
+```typescript
+// Browser → Extension
+{ type: 'connect', sessionCode: 'A3F9K2' }
+{ type: 'audio', audio: 'base64...', mimeType: 'audio/webm' }
+{ type: 'stopRecording' }
+{ type: 'ping' }
+
+// Extension → Browser
+{ type: 'connected', sessionId: 'xxx' }
+{ type: 'transcript', text: 'Hello Claude...' }
+{ type: 'response', text: 'Claude says...' }
+{ type: 'ttsAudio', audio: 'base64...', mimeType: 'audio/mp3' }
+{ type: 'error', message: '...' }
+{ type: 'pong' }
+```
+
+### Configuration
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `claudeCodeChat.voice.browserMode` | boolean | `false` | Prefer browser voice mode |
+| `claudeCodeChat.voice.sessionTimeout` | number | `1800` | Session timeout in seconds |
 
 ---
 

@@ -7,6 +7,7 @@ import * as os from 'os';
 import getHtml from './ui';
 import { VoicePopupServer } from './voice-popup-server';
 import { VoiceRecorder } from './voice-recorder';
+import { VoiceBridgeServer } from './voice-bridge-server';
 
 // Use sound-play for native audio playback (bypasses webview autoplay restrictions)
 // Wrapped in try-catch for platforms where native module fails
@@ -35,7 +36,7 @@ export function activate(context: vscode.ExtensionContext) {
 	console.log('Claude Code Chat extension is being activated!');
 	const provider = new ClaudeChatProvider(context.extensionUri, context);
 
-	// Initialize voice popup server
+	// Initialize voice popup server (for single-use browser popup)
 	const voiceServer = new VoicePopupServer(context, (transcript: string) => {
 		// When voice input is received, send to Claude
 		console.log('Voice transcript received:', transcript);
@@ -43,6 +44,14 @@ export function activate(context: vscode.ExtensionContext) {
 	});
 	voiceServer.start();
 	provider.setVoiceServer(voiceServer);
+
+	// Initialize voice bridge server (for persistent browser mode)
+	const voiceBridge = new VoiceBridgeServer(context, (transcript: string) => {
+		console.log('Voice bridge transcript received:', transcript);
+		provider.sendVoiceMessage(transcript);
+	});
+	voiceBridge.start();
+	provider.setVoiceBridge(voiceBridge);
 
 	const disposable = vscode.commands.registerCommand('claude-code-chat.openChat', (column?: vscode.ViewColumn) => {
 		console.log('Claude Code Chat command executed!');
@@ -253,6 +262,7 @@ class ClaudeChatProvider {
 	private _draftMessage: string = '';
 	private _voiceServer: VoicePopupServer | undefined;
 	private _voiceRecorder: VoiceRecorder | undefined;
+	private _voiceBridge: VoiceBridgeServer | undefined;
 
 	constructor(
 		private readonly _extensionUri: vscode.Uri,
@@ -285,6 +295,30 @@ class ClaudeChatProvider {
 
 	public setVoiceRecorder(recorder: VoiceRecorder): void {
 		this._voiceRecorder = recorder;
+	}
+
+	public setVoiceBridge(bridge: VoiceBridgeServer): void {
+		this._voiceBridge = bridge;
+	}
+
+	public openVoiceBridgeMode(): string | null {
+		if (this._voiceBridge) {
+			const sessionCode = this._voiceBridge.openVoiceBridge();
+			// Notify webview about the session code
+			this._postMessage({
+				type: 'voiceBridgeSession',
+				sessionCode: sessionCode,
+				url: this._voiceBridge.getVoiceBridgeUrl()
+			});
+			return sessionCode;
+		}
+		return null;
+	}
+
+	public sendTTSToVoiceBridge(text: string): void {
+		if (this._voiceBridge) {
+			this._voiceBridge.sendTTSResponse(text);
+		}
 	}
 
 	public sendVoiceMessage(transcript: string): void {
@@ -526,6 +560,10 @@ class ClaudeChatProvider {
 			case 'startVoice':
 				// Execute the voice command which handles native recording with fallback
 				vscode.commands.executeCommand('claude-code-chat.startVoice');
+				return;
+			case 'startBrowserVoice':
+				// Open persistent browser voice mode
+				this.openVoiceBridgeMode();
 				return;
 			case 'transcribeAudio':
 				// Handle audio from direct webview microphone capture

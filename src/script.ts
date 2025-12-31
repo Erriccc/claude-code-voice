@@ -996,6 +996,25 @@ const getScript = (isTelemetryEnabled: boolean) => `<script>
 			}
 		}
 
+		function startBrowserVoiceMode() {
+			console.log('Starting browser voice mode...');
+			vscode.postMessage({ type: 'startBrowserVoice' });
+		}
+
+		// Handle voice bridge session code from extension
+		window.addEventListener('message', (event) => {
+			const message = event.data;
+			if (message.type === 'voiceBridgeSession') {
+				const browserVoiceBtn = document.querySelector('.browser-voice-btn');
+				if (browserVoiceBtn) {
+					browserVoiceBtn.classList.add('connected');
+					browserVoiceBtn.title = 'Browser Voice Mode - Session: ' + message.sessionCode;
+				}
+				// Show notification with session code
+				showNotification('Browser Voice Mode started! Session code: ' + message.sessionCode + '. A browser tab has opened.', 'info');
+			}
+		});
+
 		function togglePlanMode() {
 			planModeEnabled = !planModeEnabled;
 			const switchElement = document.getElementById('planModeSwitch');
