@@ -5,9 +5,10 @@ import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
 import getHtml from './ui';
-import { VoicePopupServer } from './voice-popup-server';
 import { VoiceRecorder } from './voice-recorder';
 import { VoiceBridgeServer } from './voice-bridge-server';
+import { VoiceService } from './voice-service';
+import { StreamingTTSManager, MessageQueue, PlaybackState } from './streaming-tts-manager';
 
 // Use sound-play for native audio playback (bypasses webview autoplay restrictions)
 // Wrapped in try-catch for platforms where native module fails
@@ -36,16 +37,11 @@ export function activate(context: vscode.ExtensionContext) {
 	console.log('Claude Code Chat extension is being activated!');
 	const provider = new ClaudeChatProvider(context.extensionUri, context);
 
-	// Initialize voice popup server (for single-use browser popup)
-	const voiceServer = new VoicePopupServer(context, (transcript: string) => {
-		// When voice input is received, send to Claude
-		console.log('Voice transcript received:', transcript);
-		provider.sendVoiceMessage(transcript);
-	});
-	voiceServer.start();
-	provider.setVoiceServer(voiceServer);
+	// Initialize voice service (for STT/TTS via OpenAI)
+	const voiceService = new VoiceService();
+	provider.setVoiceService(voiceService);
 
-	// Initialize voice bridge server (for persistent browser mode)
+	// Initialize voice bridge server (for browser voice mode - single server on port 9877)
 	const voiceBridge = new VoiceBridgeServer(context, (transcript: string) => {
 		console.log('Voice bridge transcript received:', transcript);
 		provider.sendVoiceMessage(transcript);
@@ -83,17 +79,34 @@ export function activate(context: vscode.ExtensionContext) {
 			return;
 		}
 
-		// Try native recording first
-		console.log('Checking native recording availability...');
-		let nativeAvailable = false;
-		try {
-			nativeAvailable = await voiceRecorder.isAvailable();
-			console.log('Native recording available:', nativeAvailable);
-		} catch (err) {
-			console.error('Error checking native availability:', err);
+		// Get voice input mode setting
+		const config = vscode.workspace.getConfiguration('claudeCodeChat');
+		const inputMode = config.get<string>('voice.inputMode', 'auto');
+		console.log('Voice input mode:', inputMode);
+
+		// Determine if we should use native recording
+		let useNative = false;
+
+		if (inputMode === 'browser') {
+			// Force browser mode
+			console.log('Browser-only mode selected');
+			useNative = false;
+		} else if (inputMode === 'native') {
+			// Force native mode (will fail if not available)
+			useNative = true;
+		} else {
+			// Auto mode: try native first
+			console.log('Checking native recording availability...');
+			try {
+				useNative = await voiceRecorder.isAvailable();
+				console.log('Native recording available:', useNative);
+			} catch (err) {
+				console.error('Error checking native availability:', err);
+				useNative = false;
+			}
 		}
 
-		if (nativeAvailable) {
+		if (useNative) {
 			console.log('Using native microphone recording (Audify)');
 			vscode.window.showInformationMessage('Recording... Speak now! (Will auto-stop on silence)');
 
@@ -101,8 +114,8 @@ export function activate(context: vscode.ExtensionContext) {
 				const result = await voiceRecorder.startRecording();
 				console.log('Recording complete, duration:', result.duration, 's');
 
-				// Transcribe the audio
-				const transcript = await voiceServer.transcribeAudio(result.audioBuffer, result.mimeType);
+				// Transcribe the audio using VoiceService
+				const transcript = await voiceService.transcribe(result.audioBuffer, result.mimeType);
 				if (transcript && transcript.trim()) {
 					console.log('Transcript:', transcript);
 					provider.sendVoiceMessage(transcript);
@@ -113,12 +126,22 @@ export function activate(context: vscode.ExtensionContext) {
 			} catch (error) {
 				console.error('Native recording error:', error);
 				vscode.window.showErrorMessage(`Recording failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+				// Offer to switch to browser mode on failure
+				const choice = await vscode.window.showWarningMessage(
+					'Native recording failed. Would you like to try browser mode?',
+					'Use Browser',
+					'Cancel'
+				);
+				if (choice === 'Use Browser') {
+					// Open browser voice mode via voice bridge
+					provider.openVoiceBridgeMode();
+				}
 			}
 		} else {
-			// Fall back to browser popup
-			console.log('Native recording not available, using browser popup');
+			// Use browser voice mode via voice bridge
+			console.log('Using browser for voice input');
 			vscode.window.showInformationMessage('Using browser for voice input');
-			voiceServer.openVoiceCapture();
+			provider.openVoiceBridgeMode();
 		}
 	});
 
@@ -153,10 +176,10 @@ export function activate(context: vscode.ExtensionContext) {
 
 	context.subscriptions.push(disposable, loadConversationDisposable, voiceDisposable, stopVoiceDisposable, configChangeDisposable, statusBarItem);
 
-	// Cleanup voice server and recorder on deactivation
+	// Cleanup voice bridge and recorder on deactivation
 	context.subscriptions.push({
 		dispose: () => {
-			voiceServer.stop();
+			voiceBridge.stop();
 			voiceRecorder.dispose();
 		}
 	});
@@ -260,9 +283,11 @@ class ClaudeChatProvider {
 	private _selectedModel: string = 'default'; // Default model
 	private _isProcessing: boolean | undefined;
 	private _draftMessage: string = '';
-	private _voiceServer: VoicePopupServer | undefined;
+	private _voiceService: VoiceService | undefined;
 	private _voiceRecorder: VoiceRecorder | undefined;
 	private _voiceBridge: VoiceBridgeServer | undefined;
+	private _streamingTTS: StreamingTTSManager | undefined;
+	private _messageQueue: MessageQueue | undefined;
 
 	constructor(
 		private readonly _extensionUri: vscode.Uri,
@@ -283,14 +308,86 @@ class ClaudeChatProvider {
 		// Load cached subscription type (will be refreshed on first message)
 		this._subscriptionType = this._context.globalState.get('claude.subscriptionType');
 
-		// Resume session from latest conversation
+		// Resume session - try globalState first (faster), then fall back to latest conversation
+		const persistedSessionId = this._context.globalState.get<string>('claude.currentSessionId');
 		const latestConversation = this._getLatestConversation();
-		this._currentSessionId = latestConversation?.sessionId;
+		this._currentSessionId = persistedSessionId || latestConversation?.sessionId;
+		console.log('Restored session ID:', this._currentSessionId,
+			persistedSessionId ? '(from globalState)' : '(from latest conversation)');
 	}
 
 	// Voice support methods
-	public setVoiceServer(server: VoicePopupServer): void {
-		this._voiceServer = server;
+	public setVoiceService(service: VoiceService): void {
+		this._voiceService = service;
+
+		// Initialize streaming TTS manager with callbacks
+		this._streamingTTS = new StreamingTTSManager(service, {
+			onBrowserAudio: (audioBase64, text, isLast) => {
+				// Send streaming audio to browser voice bridge
+				if (this._voiceBridge) {
+					this._voiceBridge.sendStreamingAudio(audioBase64, text, isLast);
+				}
+			},
+			onWebviewAudio: (audioBase64, mimeType) => {
+				// Send to webview for playback
+				this._postMessage({
+					type: 'playAudio',
+					audio: audioBase64,
+					mimeType: mimeType
+				});
+			},
+			onStateChange: (state: PlaybackState) => {
+				// Notify webview and browser of playback state change
+				this._postMessage({
+					type: 'ttsStateChange',
+					state: state
+				});
+				if (this._voiceBridge) {
+					this._voiceBridge.sendPlaybackState(state);
+				}
+			},
+			onSentenceStart: (text, index, total) => {
+				console.log(`StreamingTTS: Playing sentence ${index + 1}/${total}`);
+				// Notify webview of progress
+				this._postMessage({
+					type: 'ttsProgress',
+					current: index + 1,
+					total: total,
+					text: text
+				});
+			},
+			onComplete: () => {
+				console.log('StreamingTTS: Playback complete');
+				this._postMessage({
+					type: 'ttsComplete'
+				});
+			},
+			onInterrupt: () => {
+				console.log('StreamingTTS: Playback interrupted by user');
+				this._postMessage({
+					type: 'ttsInterrupted'
+				});
+			}
+		});
+
+		// Initialize message queue for multi-turn conversations
+		this._messageQueue = new MessageQueue(
+			async (message) => {
+				// This callback processes queued messages
+				await this._sendMessageToClaude(message);
+			},
+			(queue) => {
+				// Notify webview of queue changes
+				this._postMessage({
+					type: 'messageQueueUpdate',
+					queue: queue.map(m => ({
+						id: m.id,
+						text: m.text.substring(0, 50) + (m.text.length > 50 ? '...' : ''),
+						status: m.status
+					}))
+				});
+			}
+		);
 	}
 
 	public setVoiceRecorder(recorder: VoiceRecorder): void {
@@ -299,17 +396,43 @@ class ClaudeChatProvider {
 
 	public setVoiceBridge(bridge: VoiceBridgeServer): void {
 		this._voiceBridge = bridge;
+
+		// Wire up permission response callback for voice-based approvals
+		bridge.setPermissionResponseCallback((requestId, approved, alwaysAllow) => {
+			console.log('Voice permission response:', { requestId, approved, alwaysAllow });
+			this._handlePermissionResponse(requestId, approved, alwaysAllow);
+		});
 	}
 
-	public openVoiceBridgeMode(): string | null {
+	public async openVoiceBridgeMode(): Promise<string | null> {
 		if (this._voiceBridge) {
-			const sessionCode = this._voiceBridge.openVoiceBridge();
+			const sessionCode = await this._voiceBridge.openVoiceBridge();
+			const url = await this._voiceBridge.getExternalUrl();
+
+			// Show VS Code notification with session code (easy to see)
+			vscode.window.showInformationMessage(
+				`Voice Bridge Session Code: ${sessionCode}`,
+				'Copy Code'
+			).then(selection => {
+				if (selection === 'Copy Code') {
+					vscode.env.clipboard.writeText(sessionCode);
+					vscode.window.showInformationMessage('Session code copied to clipboard!');
+				}
+			});
+
 			// Notify webview about the session code
 			this._postMessage({
 				type: 'voiceBridgeSession',
 				sessionCode: sessionCode,
-				url: this._voiceBridge.getVoiceBridgeUrl()
+				url: url
 			});
+
+			// Also add a system message to the chat
+			this._postMessage({
+				type: 'systemMessage',
+				text: `🌐 **Browser Voice Mode Started**\n\nSession Code: **${sessionCode}**\n\nA browser tab has opened. Enter the code above to connect.\n\nURL: ${url}`
+			});
+
 			return sessionCode;
 		}
 		return null;
@@ -328,73 +451,53 @@ class ClaudeChatProvider {
 		}
 	}
 
-	public openVoiceCapture(): void {
-		this._voiceServer?.openVoiceCapture();
+	public async openVoiceCapture(): Promise<void> {
+		// Redirect to voice bridge mode (browser voice)
+		await this.openVoiceBridgeMode();
 	}
 
 	/**
-	 * Speak text using TTS - plays audio NATIVELY via Node.js (bypasses webview autoplay restrictions)
+	 * Speak text using TTS with streaming support
+	 * Uses StreamingTTSManager for sentence-level streaming and interrupt handling
 	 */
 	public async speakResponse(text: string): Promise<void> {
 		console.log('speakResponse called with text length:', text.length);
 
-		if (!this._voiceServer) {
-			console.log('No voice server available');
-			return;
-		}
 		if (!text.trim()) {
 			console.log('Empty text, skipping TTS');
 			return;
 		}
 
+		// Check if TTS is enabled
 		const config = vscode.workspace.getConfiguration('claudeCodeChat');
 		const autoPlay = config.get<boolean>('voice.autoPlayResponses', false);
-		console.log('autoPlayResponses setting:', autoPlay);
+		const hasBrowserBridge = this._voiceBridge?.hasActiveSession();
 
-		if (!autoPlay) {
-			console.log('Auto-play disabled, skipping TTS');
+		// Skip if auto-play disabled AND no browser bridge connected
+		if (!autoPlay && !hasBrowserBridge) {
+			console.log('Auto-play disabled and no browser bridge, skipping TTS');
 			return;
 		}
 
-		try {
-			console.log('Calling TTS for text:', text.substring(0, 50) + '...');
-			const audioBuffer = await this._voiceServer.getAudioForText(text);
-			if (audioBuffer) {
-				console.log('Got audio buffer, size:', audioBuffer.length);
-
-				// Play audio NATIVELY via Node.js - bypasses webview autoplay restrictions!
-				if (soundPlay) {
-					// Write to temp file and play with sound-play
-					const tempFile = path.join(os.tmpdir(), `claude-tts-${Date.now()}.mp3`);
-					fs.writeFileSync(tempFile, audioBuffer);
-					console.log('Wrote audio to temp file:', tempFile);
-
-					try {
-						console.log('Playing audio natively via sound-play...');
-						await soundPlay.play(tempFile);
-						console.log('Audio playback completed!');
-					} catch (playError) {
-						console.error('Native audio playback failed:', playError);
-						// Fallback: send to webview (user will need to click play button)
-						const base64Audio = audioBuffer.toString('base64');
-						this._postMessage({
-							type: 'playAudio',
-							audio: base64Audio,
-							mimeType: 'audio/mp3'
-						});
-						console.log('Fell back to webview playback');
-					} finally {
-						// Clean up temp file
-						try {
-							fs.unlinkSync(tempFile);
-							console.log('Cleaned up temp file');
-						} catch (e) {
-							// Ignore cleanup errors
-						}
+		// Use streaming TTS manager if available
+		if (this._streamingTTS) {
+			console.log('Using streaming TTS for response');
+			try {
+				await this._streamingTTS.streamText(text);
+			} catch (error) {
+				console.error('Streaming TTS error:', error);
+			}
+		} else if (this._voiceService) {
+			// Fallback to non-streaming TTS
+			console.log('Falling back to non-streaming TTS');
+			try {
+				const audioBuffer = await this._voiceService.synthesize(text);
+				if (audioBuffer) {
+					// Send to browser bridge
+					if (this._voiceBridge) {
+						this._voiceBridge.sendTTSResponse(text);
 					}
-				} else {
-					// sound-play not available, use webview fallback
-					console.log('sound-play not available, using webview playback');
+					// Send to webview
 					const base64Audio = audioBuffer.toString('base64');
 					this._postMessage({
 						type: 'playAudio',
@@ -402,12 +505,56 @@ class ClaudeChatProvider {
 						mimeType: 'audio/mp3'
 					});
 				}
-			} else {
-				console.log('No audio buffer returned from TTS');
+			} catch (error) {
+				console.error('TTS error:', error);
 			}
-		} catch (error) {
-			console.error('TTS error:', error);
-			vscode.window.showErrorMessage(`TTS Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
+		}
+	}
+
+	/**
+	 * Pause TTS playback
+	 */
+	public pauseTTS(): void {
+		this._streamingTTS?.pause();
+	}
+
+	/**
+	 * Resume TTS playback
+	 */
+	public resumeTTS(): void {
+		this._streamingTTS?.resume();
+	}
+
+	/**
+	 * Stop TTS playback
+	 */
+	public async stopTTS(): Promise<void> {
+		await this._streamingTTS?.stop();
+	}
+
+	/**
+	 * Interrupt TTS (user wants to speak)
+	 */
+	public async interruptTTS(): Promise<void> {
+		await this._streamingTTS?.interrupt();
+	}
+
+	/**
+	 * Check if TTS is currently playing
+	 */
+	public isTTSPlaying(): boolean {
+		return this._streamingTTS?.isActive() || false;
+	}
+
+	/**
+	 * Queue a message (allows adding messages while Claude is processing)
+	 */
+	public queueMessage(text: string): void {
+		if (this._messageQueue) {
+			this._messageQueue.addMessage(text);
+		} else {
+			// No queue, send directly
+			this._sendMessageToClaude(text);
 		}
 	}
 
@@ -417,9 +564,9 @@ class ClaudeChatProvider {
 	private async _transcribeWebviewAudio(base64Audio: string, mimeType: string): Promise<void> {
 		console.log('Transcribing audio from webview, mimeType:', mimeType);
 
-		if (!this._voiceServer) {
-			console.error('No voice server available for transcription');
-			vscode.window.showErrorMessage('Voice server not available');
+		if (!this._voiceService) {
+			console.error('No voice service available for transcription');
+			vscode.window.showErrorMessage('Voice service not available');
 			return;
 		}
 
@@ -429,7 +576,7 @@ class ClaudeChatProvider {
 			console.log('Audio buffer size:', audioBuffer.length);
 
 			// Call the voice service to transcribe
-			const transcript = await this._voiceServer.transcribeAudio(audioBuffer, mimeType);
+			const transcript = await this._voiceService.transcribe(audioBuffer, mimeType);
 
 			if (transcript && transcript.trim()) {
 				console.log('Transcription result:', transcript);
@@ -1060,6 +1207,8 @@ class ClaudeChatProvider {
 					// System initialization message - session ID will be captured from final result
 					console.log('System initialized');
 					this._currentSessionId = jsonData.session_id;
+					// Persist session ID for restart recovery
+					void this._context.globalState.update('claude.currentSessionId', jsonData.session_id);
 					//this._sendAndSaveMessage({ type: 'init', data: { sessionId: jsonData.session_id; } })
 
 					// Show session info in UI
@@ -1315,6 +1464,8 @@ class ClaudeChatProvider {
 						});
 
 						this._currentSessionId = jsonData.session_id;
+						// Persist session ID for restart recovery
+						void this._context.globalState.update('claude.currentSessionId', jsonData.session_id);
 
 						// Show session info in UI
 						this._sendAndSaveMessage({
@@ -1833,6 +1984,29 @@ class ClaudeChatProvider {
 				status: 'pending'
 			}
 		});
+
+		// Also send to voice bridge for voice-based approval
+		if (this._voiceBridge?.hasActiveSession()) {
+			// Format permission request for voice
+			let voicePrompt = `Permission needed: ${toolName}`;
+			if (toolName === 'Bash' && input.command) {
+				voicePrompt = `Run command: ${input.command}`;
+			} else if (toolName === 'Edit' && input.file_path) {
+				voicePrompt = `Edit file: ${(input.file_path as string).split('/').pop()}`;
+			} else if (toolName === 'Write' && input.file_path) {
+				voicePrompt = `Create file: ${(input.file_path as string).split('/').pop()}`;
+			} else if (toolName === 'Read' && input.file_path) {
+				voicePrompt = `Read file: ${(input.file_path as string).split('/').pop()}`;
+			}
+
+			this._voiceBridge.sendPermissionRequest({
+				id: requestId,
+				tool: toolName,
+				prompt: voicePrompt,
+				input: input,
+				pattern: pattern
+			});
+		}
 	}
 
 	/**
@@ -2880,7 +3054,8 @@ class ClaudeChatProvider {
 			'wsl.distro': config.get<string>('wsl.distro', 'Ubuntu'),
 			'wsl.nodePath': config.get<string>('wsl.nodePath', '/usr/bin/node'),
 			'wsl.claudePath': config.get<string>('wsl.claudePath', '/usr/local/bin/claude'),
-			'permissions.yoloMode': config.get<boolean>('permissions.yoloMode', false)
+			'permissions.yoloMode': config.get<boolean>('permissions.yoloMode', false),
+			'voice.inputMode': config.get<string>('voice.inputMode', 'auto')
 		};
 
 		this._postMessage({

@@ -8,6 +8,7 @@
 import * as vscode from 'vscode';
 import * as http from 'http';
 import * as crypto from 'crypto';
+import { execSync } from 'child_process';
 import { VoiceService } from './voice-service';
 
 const BRIDGE_PORT = 9877;
@@ -125,20 +126,48 @@ export class VoiceBridgeServer {
      * Get the URL for the voice bridge page
      */
     getVoiceBridgeUrl(): string {
-        const isCodespaces = process.env.CODESPACES === 'true';
-        const codespaceName = process.env.CODESPACE_NAME;
-        const githubCodespacesPortForwardingDomain = process.env.GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN;
-
-        if (isCodespaces && codespaceName && githubCodespacesPortForwardingDomain) {
-            return `https://${codespaceName}-${BRIDGE_PORT}.${githubCodespacesPortForwardingDomain}`;
-        }
         return `http://127.0.0.1:${BRIDGE_PORT}`;
+    }
+
+    /**
+     * Get the external URL (handles Codespaces port forwarding)
+     */
+    async getExternalUrl(): Promise<string> {
+        try {
+            const localUri = vscode.Uri.parse(`http://127.0.0.1:${BRIDGE_PORT}`);
+            const externalUri = await vscode.env.asExternalUri(localUri);
+            return externalUri.toString();
+        } catch {
+            return this.getVoiceBridgeUrl();
+        }
+    }
+
+    /**
+     * Kill any existing process on the bridge port
+     */
+    private killExistingProcess(): void {
+        try {
+            const platform = process.platform;
+            if (platform === 'darwin' || platform === 'linux') {
+                // macOS/Linux: Use lsof to find and kill process
+                execSync(`lsof -ti:${BRIDGE_PORT} | xargs kill -9 2>/dev/null || true`, { stdio: 'ignore' });
+            } else if (platform === 'win32') {
+                // Windows: Use netstat and taskkill
+                execSync(`for /f "tokens=5" %a in ('netstat -aon ^| findstr :${BRIDGE_PORT}') do taskkill /F /PID %a 2>nul`, { stdio: 'ignore', shell: 'cmd.exe' });
+            }
+            console.log(`Cleared any existing process on port ${BRIDGE_PORT}`);
+        } catch (e) {
+            // Ignore errors - port might not be in use
+        }
     }
 
     /**
      * Start the HTTP server with SSE support
      */
     start(): void {
+        // Kill any existing process on the port first
+        this.killExistingProcess();
+
         this.httpServer = http.createServer(async (req, res) => {
             // Enable CORS
             res.setHeader('Access-Control-Allow-Origin', '*');
@@ -156,16 +185,47 @@ export class VoiceBridgeServer {
             if (url.pathname === '/' || url.pathname === '/index.html') {
                 this.serveVoiceBridgePage(res);
             } else if (url.pathname === '/connect' && req.method === 'POST') {
+                console.log('Connect request received, active sessions:', Array.from(this.sessions.keys()));
                 await this.handleConnect(req, res);
             } else if (url.pathname === '/events' && req.method === 'GET') {
                 this.handleSSE(req, res);
             } else if (url.pathname === '/audio' && req.method === 'POST') {
                 await this.handleAudio(req, res);
+            } else if (url.pathname === '/permission' && req.method === 'POST') {
+                await this.handlePermission(req, res);
             } else if (url.pathname === '/status' && req.method === 'GET') {
                 this.handleStatus(res);
             } else {
                 res.writeHead(404);
                 res.end('Not found');
+            }
+        });
+
+        let retryCount = 0;
+        const maxRetries = 1;
+
+        this.httpServer.on('error', (err: NodeJS.ErrnoException) => {
+            if (err.code === 'EADDRINUSE') {
+                if (retryCount < maxRetries) {
+                    retryCount++;
+                    console.error(`Voice bridge port ${BRIDGE_PORT} already in use. Will retry once after delay...`);
+                    // Try once more after a longer delay
+                    setTimeout(() => {
+                        try {
+                            this.httpServer?.listen(BRIDGE_PORT, '0.0.0.0');
+                        } catch (e) {
+                            console.error('Voice bridge server failed to start after retry');
+                        }
+                    }, 3000);
+                } else {
+                    console.error(`Voice bridge port ${BRIDGE_PORT} still in use. Please restart VS Code to free the port.`);
+                    vscode.window.showWarningMessage(
+                        'Voice bridge port is in use. Please restart VS Code or close other instances.',
+                        'OK'
+                    );
+                }
+            } else {
+                console.error('Voice bridge server error:', err);
             }
         });
 
@@ -312,7 +372,7 @@ export class VoiceBridgeServer {
     }
 
     /**
-     * Send Claude's response to be spoken in browser
+     * Send Claude's response to be spoken in browser (legacy non-streaming)
      */
     sendTTSResponse(text: string): void {
         if (this.currentSessionCode) {
@@ -325,7 +385,9 @@ export class VoiceBridgeServer {
                         this.sendToSession(this.currentSessionCode!, 'tts', {
                             audio: base64Audio,
                             mimeType: 'audio/mp3',
-                            text: text
+                            text: text,
+                            isStreaming: false,
+                            isLast: true
                         });
                     }
                 }).catch(err => {
@@ -335,6 +397,112 @@ export class VoiceBridgeServer {
                 });
             }
         }
+    }
+
+    /**
+     * Send streaming audio chunk to browser (called by StreamingTTSManager)
+     */
+    sendStreamingAudio(audioBase64: string, text: string, isLast: boolean): void {
+        if (this.currentSessionCode) {
+            const session = this.sessions.get(this.currentSessionCode);
+            if (session && session.connected) {
+                this.sendToSession(this.currentSessionCode, 'tts', {
+                    audio: audioBase64,
+                    mimeType: 'audio/mp3',
+                    text: text,
+                    isStreaming: true,
+                    isLast: isLast
+                });
+            }
+        }
+    }
+
+    /**
+     * Send playback state change to browser
+     */
+    sendPlaybackState(state: string): void {
+        if (this.currentSessionCode) {
+            const session = this.sessions.get(this.currentSessionCode);
+            if (session && session.connected) {
+                this.sendToSession(this.currentSessionCode, 'playbackState', {
+                    state: state
+                });
+            }
+        }
+    }
+
+    /**
+     * Check if there's an active session connected
+     */
+    hasActiveSession(): boolean {
+        if (!this.currentSessionCode) return false;
+        const session = this.sessions.get(this.currentSessionCode);
+        return !!(session && session.connected);
+    }
+
+    /**
+     * Send permission request to browser for voice/button approval
+     */
+    sendPermissionRequest(request: {
+        id: string;
+        tool: string;
+        prompt: string;
+        input: Record<string, unknown>;
+        pattern?: string;
+    }): void {
+        if (this.currentSessionCode) {
+            const session = this.sessions.get(this.currentSessionCode);
+            if (session && session.connected) {
+                // Track pending permission for voice responses
+                this.pendingPermissionId = request.id;
+
+                // Send permission request event
+                this.sendToSession(this.currentSessionCode, 'permissionRequest', {
+                    id: request.id,
+                    tool: request.tool,
+                    prompt: request.prompt,
+                    input: request.input,
+                    pattern: request.pattern
+                });
+
+                // Also speak the permission request via TTS
+                this.voiceService.synthesize(request.prompt + '. Say yes to allow or no to deny.')
+                    .then(audioBuffer => {
+                        if (audioBuffer) {
+                            const base64Audio = audioBuffer.toString('base64');
+                            this.sendToSession(this.currentSessionCode!, 'tts', {
+                                audio: base64Audio,
+                                mimeType: 'audio/mp3',
+                                text: request.prompt,
+                                isPermission: true
+                            });
+                        }
+                    })
+                    .catch(err => console.error('Permission TTS error:', err));
+            }
+        }
+    }
+
+    /**
+     * Handle permission response from browser
+     */
+    private handlePermissionResponse(approved: boolean, requestId: string, alwaysAllow: boolean = false): void {
+        // Forward to the callback that was set
+        if (this.onPermissionResponse) {
+            this.onPermissionResponse(requestId, approved, alwaysAllow);
+        }
+    }
+
+    /**
+     * Callback for permission responses
+     */
+    private onPermissionResponse?: (requestId: string, approved: boolean, alwaysAllow: boolean) => void;
+
+    /**
+     * Set callback for handling permission responses from browser
+     */
+    setPermissionResponseCallback(callback: (requestId: string, approved: boolean, alwaysAllow: boolean) => void): void {
+        this.onPermissionResponse = callback;
     }
 
     /**
@@ -377,6 +545,17 @@ export class VoiceBridgeServer {
                 // Send transcript event
                 this.sendToSession(validSession!.code, 'transcript', { text: transcript });
 
+                // Check if this is a permission response (yes/no) before sending to Claude
+                if (this.checkForPermissionResponse(transcript)) {
+                    console.log('Handled as permission response');
+                    // Clear permission UI in browser
+                    this.sendToSession(validSession!.code, 'permissionHandled', { handled: true });
+
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: true, transcript, isPermissionResponse: true }));
+                    return;
+                }
+
                 // Send to Claude via callback
                 this.onTranscript(transcript);
 
@@ -391,6 +570,83 @@ export class VoiceBridgeServer {
                 }));
             }
         });
+    }
+
+    /**
+     * Handle permission response from browser (button click or voice)
+     */
+    private async handlePermission(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+        const token = req.headers['x-session-token'] as string;
+
+        // Validate token
+        let validSession: Session | undefined;
+        for (const session of this.sessions.values()) {
+            if (session.token === token && session.connected) {
+                validSession = session;
+                break;
+            }
+        }
+
+        if (!validSession) {
+            res.writeHead(401, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Invalid or expired session' }));
+            return;
+        }
+
+        const chunks: Buffer[] = [];
+        req.on('data', (chunk: Buffer) => chunks.push(chunk));
+        req.on('end', () => {
+            try {
+                const body = JSON.parse(Buffer.concat(chunks).toString());
+                const { requestId, approved, alwaysAllow } = body;
+
+                console.log('Permission response from browser:', { requestId, approved, alwaysAllow });
+
+                // Forward to the callback
+                this.handlePermissionResponse(approved, requestId, alwaysAllow || false);
+
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: true }));
+            } catch (error) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Invalid request' }));
+            }
+        });
+    }
+
+    /**
+     * Track pending permission request ID for voice responses
+     */
+    private pendingPermissionId: string | null = null;
+
+    /**
+     * Check if transcript is a permission response (yes/no)
+     */
+    private checkForPermissionResponse(transcript: string): boolean {
+        if (!this.pendingPermissionId) return false;
+
+        const lower = transcript.toLowerCase().trim();
+
+        // Check for approval phrases
+        const approvalPhrases = ['yes', 'yeah', 'yep', 'approve', 'allow', 'go ahead', 'do it', 'okay', 'ok'];
+        const denialPhrases = ['no', 'nope', 'deny', 'stop', 'cancel', 'don\'t', 'reject'];
+
+        const isApproval = approvalPhrases.some(phrase => lower.includes(phrase));
+        const isDenial = denialPhrases.some(phrase => lower.includes(phrase));
+
+        if (isApproval && !isDenial) {
+            console.log('Voice permission approved:', this.pendingPermissionId);
+            this.handlePermissionResponse(true, this.pendingPermissionId, false);
+            this.pendingPermissionId = null;
+            return true;
+        } else if (isDenial && !isApproval) {
+            console.log('Voice permission denied:', this.pendingPermissionId);
+            this.handlePermissionResponse(false, this.pendingPermissionId, false);
+            this.pendingPermissionId = null;
+            return true;
+        }
+
+        return false;
     }
 
     /**
@@ -559,6 +815,94 @@ export class VoiceBridgeServer {
             color: #ccd6f6;
             margin-bottom: 20px;
             min-height: 24px;
+            font-size: 16px;
+        }
+
+        /* Playback Controls */
+        .playback-controls {
+            display: flex;
+            gap: 12px;
+            justify-content: center;
+            margin-bottom: 20px;
+        }
+        .control-btn {
+            width: 50px;
+            height: 50px;
+            border-radius: 50%;
+            border: 2px solid rgba(255, 255, 255, 0.2);
+            background: rgba(255, 255, 255, 0.1);
+            color: white;
+            font-size: 20px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .control-btn:hover {
+            background: rgba(255, 255, 255, 0.2);
+            border-color: rgba(255, 255, 255, 0.4);
+        }
+        .control-btn:active {
+            transform: scale(0.95);
+        }
+        .control-btn.stop {
+            border-color: rgba(233, 69, 96, 0.5);
+        }
+        .control-btn.stop:hover {
+            background: rgba(233, 69, 96, 0.3);
+            border-color: rgba(233, 69, 96, 0.7);
+        }
+
+        /* Audio Queue Status */
+        .queue-status {
+            font-size: 12px;
+            color: #8892b0;
+            margin-bottom: 15px;
+            min-height: 18px;
+        }
+        .queue-status.active {
+            color: #64ffda;
+        }
+
+        /* Mobile Optimizations */
+        @media (max-width: 480px) {
+            body {
+                padding: 15px;
+            }
+            h1 {
+                font-size: 24px;
+            }
+            .code-input input {
+                width: 40px;
+                height: 50px;
+                font-size: 20px;
+            }
+            .mic-button {
+                width: 120px;
+                height: 120px;
+                font-size: 48px;
+            }
+            .control-btn {
+                width: 56px;
+                height: 56px;
+                font-size: 24px;
+            }
+            .chat-container {
+                max-height: 200px;
+            }
+        }
+
+        /* Larger touch targets for mobile */
+        @media (hover: none) and (pointer: coarse) {
+            .mic-button {
+                width: 130px;
+                height: 130px;
+            }
+            .control-btn {
+                width: 60px;
+                height: 60px;
+            }
         }
 
         /* Chat Display */
@@ -609,6 +953,92 @@ export class VoiceBridgeServer {
             margin-top: 15px;
         }
         .hidden { display: none !important; }
+
+        /* Permission Request UI */
+        .permission-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.8);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+            animation: fadeIn 0.2s ease;
+        }
+        .permission-card {
+            background: linear-gradient(145deg, #1e1e3f, #2a2a5a);
+            border: 2px solid #ffd93d;
+            border-radius: 16px;
+            padding: 24px;
+            max-width: 400px;
+            width: 90%;
+            text-align: center;
+            box-shadow: 0 20px 60px rgba(255, 217, 61, 0.2);
+        }
+        .permission-icon {
+            font-size: 48px;
+            margin-bottom: 16px;
+        }
+        .permission-title {
+            font-size: 18px;
+            color: #ffd93d;
+            margin-bottom: 8px;
+            font-weight: 600;
+        }
+        .permission-tool {
+            font-size: 14px;
+            color: #8892b0;
+            margin-bottom: 16px;
+        }
+        .permission-prompt {
+            font-size: 16px;
+            color: #ccd6f6;
+            margin-bottom: 20px;
+            line-height: 1.5;
+            background: rgba(0, 0, 0, 0.3);
+            padding: 12px;
+            border-radius: 8px;
+            word-break: break-word;
+        }
+        .permission-buttons {
+            display: flex;
+            gap: 12px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+        .permission-btn {
+            padding: 12px 28px;
+            font-size: 16px;
+            font-weight: 600;
+            border: none;
+            border-radius: 25px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        .permission-btn.approve {
+            background: linear-gradient(145deg, #64ffda, #00bcd4);
+            color: #0f0f23;
+        }
+        .permission-btn.approve:hover {
+            transform: scale(1.05);
+            box-shadow: 0 5px 20px rgba(100, 255, 218, 0.4);
+        }
+        .permission-btn.deny {
+            background: linear-gradient(145deg, #e94560, #c73e54);
+            color: white;
+        }
+        .permission-btn.deny:hover {
+            transform: scale(1.05);
+            box-shadow: 0 5px 20px rgba(233, 69, 96, 0.4);
+        }
+        .permission-hint {
+            font-size: 12px;
+            color: #8892b0;
+            margin-top: 16px;
+        }
     </style>
 </head>
 <body>
@@ -641,9 +1071,29 @@ export class VoiceBridgeServer {
             <button class="mic-button" id="micButton">
                 <span id="micIcon">🎤</span>
             </button>
-            <div class="voice-status" id="voiceStatus">Click to start speaking</div>
+            <div class="voice-status" id="voiceStatus">Click or press Space to speak</div>
+            <div class="queue-status" id="queueStatus"></div>
+
+            <div class="playback-controls">
+                <button class="control-btn stop" id="stopBtn" title="Stop playback">⏹</button>
+            </div>
 
             <div class="chat-container" id="chatContainer"></div>
+        </div>
+
+        <!-- Permission Request Overlay -->
+        <div class="permission-overlay hidden" id="permissionOverlay">
+            <div class="permission-card">
+                <div class="permission-icon">⚠️</div>
+                <div class="permission-title">Permission Required</div>
+                <div class="permission-tool" id="permissionTool">Tool: Bash</div>
+                <div class="permission-prompt" id="permissionPrompt">Run command: ls -la</div>
+                <div class="permission-buttons">
+                    <button class="permission-btn approve" id="permissionApprove">✓ Allow</button>
+                    <button class="permission-btn deny" id="permissionDeny">✗ Deny</button>
+                </div>
+                <div class="permission-hint">Or say "yes" / "no" to respond by voice</div>
+            </div>
         </div>
     </div>
 
@@ -655,6 +1105,12 @@ export class VoiceBridgeServer {
         let isRecording = false;
         let audioContext = null;
         let analyser = null;
+        let currentPermissionId = null;
+
+        // Audio queue for streaming TTS
+        let audioQueue = [];
+        let isPlayingAudio = false;
+        let currentAudioElement = null;
 
         // DOM elements
         const connectSection = document.getElementById('connectSection');
@@ -666,6 +1122,17 @@ export class VoiceBridgeServer {
         const micIcon = document.getElementById('micIcon');
         const voiceStatus = document.getElementById('voiceStatus');
         const chatContainer = document.getElementById('chatContainer');
+
+        // Permission elements
+        const permissionOverlay = document.getElementById('permissionOverlay');
+        const permissionTool = document.getElementById('permissionTool');
+        const permissionPrompt = document.getElementById('permissionPrompt');
+        const permissionApprove = document.getElementById('permissionApprove');
+        const permissionDeny = document.getElementById('permissionDeny');
+
+        // Playback control elements
+        const stopBtn = document.getElementById('stopBtn');
+        const queueStatusEl = document.getElementById('queueStatus');
 
         // Handle code input navigation
         codeInputs.forEach((input, index) => {
@@ -726,10 +1193,16 @@ export class VoiceBridgeServer {
 
                 if (result.success) {
                     sessionToken = result.token;
+                    // Save to localStorage for auto-reconnect
+                    localStorage.setItem('voiceBridgeCode', code);
+                    localStorage.setItem('voiceBridgeToken', result.token);
                     connectSection.classList.add('hidden');
                     voiceSection.classList.add('active');
                     setupSSE();
                 } else {
+                    // Clear saved session on failure
+                    localStorage.removeItem('voiceBridgeCode');
+                    localStorage.removeItem('voiceBridgeToken');
                     showConnectError(result.error || 'Connection failed');
                 }
             } catch (error) {
@@ -765,34 +1238,57 @@ export class VoiceBridgeServer {
 
             eventSource.addEventListener('tts', async (e) => {
                 const data = JSON.parse(e.data);
-                addChatMessage('assistant', data.text);
+                // Don't duplicate permission prompts in chat
+                if (!data.isPermission) {
+                    addChatMessage('assistant', data.text);
+                }
 
-                // Play audio
+                // Queue audio for playback
                 if (data.audio) {
-                    try {
-                        const audioData = atob(data.audio);
-                        const audioArray = new Uint8Array(audioData.length);
-                        for (let i = 0; i < audioData.length; i++) {
-                            audioArray[i] = audioData.charCodeAt(i);
-                        }
-                        const audioBlob = new Blob([audioArray], { type: data.mimeType || 'audio/mp3' });
-                        const audioUrl = URL.createObjectURL(audioBlob);
-                        const audio = new Audio(audioUrl);
-                        audio.play();
-                        voiceStatus.textContent = 'Playing response...';
-                        audio.onended = () => {
-                            voiceStatus.textContent = 'Click to start speaking';
-                            URL.revokeObjectURL(audioUrl);
-                        };
-                    } catch (err) {
-                        console.error('Audio playback error:', err);
-                    }
+                    queueAudio(data.audio, data.mimeType || 'audio/mp3', data.isPermission, data.isLast);
+                }
+            });
+
+            // Handle permission request from VS Code
+            eventSource.addEventListener('permissionRequest', (e) => {
+                const data = JSON.parse(e.data);
+                console.log('Permission request received:', data);
+                showPermission(data);
+            });
+
+            // Handle permission handled (via voice)
+            eventSource.addEventListener('permissionHandled', (e) => {
+                console.log('Permission handled via voice');
+                hidePermission();
+            });
+
+            // Handle playback control from server
+            eventSource.addEventListener('playbackState', (e) => {
+                const data = JSON.parse(e.data);
+                console.log('Playback state:', data.state);
+                if (data.state === 'stopped') {
+                    stopAudioQueue();
+                } else if (data.state === 'paused') {
+                    if (currentAudioElement) currentAudioElement.pause();
+                } else if (data.state === 'playing') {
+                    if (currentAudioElement) currentAudioElement.play();
                 }
             });
 
             eventSource.addEventListener('error', (e) => {
                 console.error('SSE error', e);
-                voiceStatus.textContent = 'Connection lost. Refresh to reconnect.';
+                if (voiceStatus) voiceStatus.textContent = 'Connection lost. Attempting to reconnect...';
+                // Try to reconnect after a short delay
+                setTimeout(() => {
+                    tryAutoReconnect().then(reconnected => {
+                        if (!reconnected) {
+                            if (voiceStatus) voiceStatus.textContent = 'Connection lost. Please enter a new code.';
+                            // Show connect section again
+                            if (connectSection) connectSection.classList.remove('hidden');
+                            if (voiceSection) voiceSection.classList.remove('active');
+                        }
+                    });
+                }, 2000);
             });
         }
 
@@ -802,6 +1298,142 @@ export class VoiceBridgeServer {
             div.innerHTML = '<div class="label">' + (role === 'user' ? 'You' : 'Claude') + '</div><div class="text">' + text + '</div>';
             chatContainer.appendChild(div);
             chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+
+        // Audio queue management for streaming TTS
+        function queueAudio(base64Audio, mimeType, isPermission, isLast) {
+            audioQueue.push({ base64Audio, mimeType, isPermission, isLast });
+            console.log('Queued audio, queue length:', audioQueue.length);
+            updateQueueStatus();
+            if (!isPlayingAudio) {
+                playNextAudio();
+            }
+        }
+
+        function playNextAudio() {
+            if (audioQueue.length === 0) {
+                isPlayingAudio = false;
+                updateQueueStatus();
+                if (!currentPermissionId && voiceStatus) {
+                    voiceStatus.textContent = 'Click or press Space to speak';
+                }
+                return;
+            }
+
+            isPlayingAudio = true;
+            const item = audioQueue.shift();
+            updateQueueStatus();
+
+            try {
+                const audioData = atob(item.base64Audio);
+                const audioArray = new Uint8Array(audioData.length);
+                for (let i = 0; i < audioData.length; i++) {
+                    audioArray[i] = audioData.charCodeAt(i);
+                }
+                const audioBlob = new Blob([audioArray], { type: item.mimeType });
+                const audioUrl = URL.createObjectURL(audioBlob);
+                currentAudioElement = new Audio(audioUrl);
+
+                if (voiceStatus) voiceStatus.textContent = item.isPermission ? 'Permission requested...' : 'Playing response...';
+
+                currentAudioElement.onended = () => {
+                    URL.revokeObjectURL(audioUrl);
+                    currentAudioElement = null;
+                    // Play next in queue
+                    playNextAudio();
+                };
+
+                currentAudioElement.onerror = (err) => {
+                    console.error('Audio playback error:', err);
+                    URL.revokeObjectURL(audioUrl);
+                    currentAudioElement = null;
+                    // Try next audio
+                    playNextAudio();
+                };
+
+                currentAudioElement.play();
+            } catch (err) {
+                console.error('Audio processing error:', err);
+                playNextAudio();
+            }
+        }
+
+        function stopAudioQueue() {
+            audioQueue = [];
+            if (currentAudioElement) {
+                currentAudioElement.pause();
+                currentAudioElement = null;
+            }
+            isPlayingAudio = false;
+            updateQueueStatus();
+            if (voiceStatus) voiceStatus.textContent = 'Click or press Space to speak';
+        }
+
+        // Permission handling
+        function showPermission(data) {
+            currentPermissionId = data.id;
+            if (permissionTool) permissionTool.textContent = 'Tool: ' + data.tool;
+            if (permissionPrompt) permissionPrompt.textContent = data.prompt;
+            if (permissionOverlay) permissionOverlay.classList.remove('hidden');
+            if (voiceStatus) voiceStatus.textContent = 'Permission required - respond by voice or buttons';
+        }
+
+        function hidePermission() {
+            currentPermissionId = null;
+            if (permissionOverlay) permissionOverlay.classList.add('hidden');
+            if (voiceStatus) voiceStatus.textContent = 'Click or press Space to speak';
+        }
+
+        async function sendPermissionResponse(approved) {
+            if (!currentPermissionId) return;
+
+            try {
+                await fetch('/permission', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-Session-Token': sessionToken
+                    },
+                    body: JSON.stringify({
+                        requestId: currentPermissionId,
+                        approved: approved,
+                        alwaysAllow: false
+                    })
+                });
+                hidePermission();
+            } catch (error) {
+                console.error('Permission response error:', error);
+            }
+        }
+
+        // Permission button handlers
+        if (permissionApprove) {
+            permissionApprove.addEventListener('click', () => sendPermissionResponse(true));
+        }
+        if (permissionDeny) {
+            permissionDeny.addEventListener('click', () => sendPermissionResponse(false));
+        }
+
+        // Stop button handler
+        if (stopBtn) {
+            stopBtn.addEventListener('click', () => {
+                stopAudioQueue();
+            });
+        }
+
+        // Update queue status display
+        function updateQueueStatus() {
+            if (!queueStatusEl) return;
+            if (audioQueue.length > 0) {
+                queueStatusEl.textContent = 'Audio queue: ' + (audioQueue.length + (isPlayingAudio ? 1 : 0)) + ' items';
+                queueStatusEl.classList.add('active');
+            } else if (isPlayingAudio) {
+                queueStatusEl.textContent = 'Playing...';
+                queueStatusEl.classList.add('active');
+            } else {
+                queueStatusEl.textContent = '';
+                queueStatusEl.classList.remove('active');
+            }
         }
 
         // Voice recording
@@ -816,13 +1448,31 @@ export class VoiceBridgeServer {
         }
 
         async function startRecording() {
+            // Interrupt any playing audio when user starts speaking
+            stopAudioQueue();
+
             try {
                 const stream = await navigator.mediaDevices.getUserMedia({
                     audio: { echoCancellation: true, noiseSuppression: true }
                 });
 
-                const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-                    ? 'audio/webm;codecs=opus' : 'audio/webm';
+                // Detect best supported audio format (Safari/iOS needs mp4, others prefer webm)
+                let mimeType = 'audio/webm';
+                const formats = [
+                    'audio/webm;codecs=opus',
+                    'audio/webm',
+                    'audio/mp4',
+                    'audio/mp4;codecs=mp4a.40.2',
+                    'audio/ogg;codecs=opus',
+                    'audio/wav'
+                ];
+                for (const format of formats) {
+                    if (MediaRecorder.isTypeSupported(format)) {
+                        mimeType = format;
+                        break;
+                    }
+                }
+                console.log('Using audio format:', mimeType);
 
                 mediaRecorder = new MediaRecorder(stream, { mimeType });
                 audioChunks = [];
@@ -839,12 +1489,12 @@ export class VoiceBridgeServer {
 
                 mediaRecorder.start();
                 isRecording = true;
-                micButton.classList.add('recording');
-                micIcon.textContent = '⏹';
-                voiceStatus.textContent = 'Listening... Click to stop';
+                if (micButton) micButton.classList.add('recording');
+                if (micIcon) micIcon.textContent = '⏹';
+                if (voiceStatus) voiceStatus.textContent = 'Listening... Click to stop';
 
             } catch (error) {
-                voiceStatus.textContent = 'Microphone access denied';
+                if (voiceStatus) voiceStatus.textContent = 'Microphone access denied';
             }
         }
 
@@ -852,10 +1502,12 @@ export class VoiceBridgeServer {
             if (mediaRecorder && mediaRecorder.state === 'recording') {
                 mediaRecorder.stop();
                 isRecording = false;
-                micButton.classList.remove('recording');
-                micButton.classList.add('processing');
-                micIcon.textContent = '⏳';
-                voiceStatus.textContent = 'Processing...';
+                if (micButton) {
+                    micButton.classList.remove('recording');
+                    micButton.classList.add('processing');
+                }
+                if (micIcon) micIcon.textContent = '⏳';
+                if (voiceStatus) voiceStatus.textContent = 'Processing...';
             }
         }
 
@@ -876,26 +1528,26 @@ export class VoiceBridgeServer {
 
                     const result = await response.json();
 
-                    micButton.classList.remove('processing');
-                    micIcon.textContent = '🎤';
+                    if (micButton) micButton.classList.remove('processing');
+                    if (micIcon) micIcon.textContent = '🎤';
 
                     if (result.success) {
-                        voiceStatus.textContent = 'Waiting for Claude...';
+                        if (voiceStatus) voiceStatus.textContent = 'Waiting for Claude...';
                     } else {
-                        voiceStatus.textContent = 'Error: ' + (result.error || 'Processing failed');
+                        if (voiceStatus) voiceStatus.textContent = 'Error: ' + (result.error || 'Processing failed');
                     }
                 };
                 reader.readAsDataURL(audioBlob);
             } catch (error) {
-                voiceStatus.textContent = 'Network error: ' + error.message;
-                micButton.classList.remove('processing');
-                micIcon.textContent = '🎤';
+                if (voiceStatus) voiceStatus.textContent = 'Network error: ' + error.message;
+                if (micButton) micButton.classList.remove('processing');
+                if (micIcon) micIcon.textContent = '🎤';
             }
         }
 
         // Keyboard shortcuts
         document.addEventListener('keydown', (e) => {
-            if (voiceSection.classList.contains('active')) {
+            if (voiceSection && voiceSection.classList.contains('active')) {
                 if (e.code === 'Space' && !isRecording) {
                     e.preventDefault();
                     startRecording();
@@ -905,6 +1557,60 @@ export class VoiceBridgeServer {
                 }
             }
         });
+
+        // Auto-reconnect on page load if we have a saved session
+        async function tryAutoReconnect() {
+            const savedCode = localStorage.getItem('voiceBridgeCode');
+            const savedToken = localStorage.getItem('voiceBridgeToken');
+
+            if (savedCode && savedToken) {
+                console.log('Attempting auto-reconnect with saved session');
+                connectBtn.textContent = 'Reconnecting...';
+                connectBtn.disabled = true;
+
+                // Pre-fill the code inputs
+                savedCode.split('').forEach((char, i) => {
+                    if (codeInputs[i]) codeInputs[i].value = char;
+                });
+
+                try {
+                    const response = await fetch('/connect', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ sessionCode: savedCode })
+                    });
+
+                    const result = await response.json();
+
+                    if (result.success) {
+                        sessionToken = result.token;
+                        localStorage.setItem('voiceBridgeToken', result.token);
+                        connectSection.classList.add('hidden');
+                        voiceSection.classList.add('active');
+                        setupSSE();
+                        console.log('Auto-reconnect successful!');
+                        return true;
+                    }
+                } catch (e) {
+                    console.log('Auto-reconnect failed:', e);
+                }
+
+                // Auto-reconnect failed, clear saved session
+                localStorage.removeItem('voiceBridgeCode');
+                localStorage.removeItem('voiceBridgeToken');
+                connectBtn.textContent = 'Connect';
+                connectBtn.disabled = false;
+                showConnectError('Session expired. Please enter a new code from VS Code.');
+            }
+            return false;
+        }
+
+        // Try auto-reconnect on load (wait for DOM to be ready)
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', tryAutoReconnect);
+        } else {
+            tryAutoReconnect();
+        }
     </script>
 </body>
 </html>`;
@@ -916,9 +1622,11 @@ export class VoiceBridgeServer {
     /**
      * Open the voice bridge in browser with current session
      */
-    openVoiceBridge(): string {
+    async openVoiceBridge(): Promise<string> {
         const code = this.createSession();
-        const url = this.getVoiceBridgeUrl();
+        // Use VS Code's API for proper Codespaces/remote URL handling
+        const url = await this.getExternalUrl();
+        console.log('Opening voice bridge at:', url);
         vscode.env.openExternal(vscode.Uri.parse(url));
         return code;
     }

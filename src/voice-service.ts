@@ -31,13 +31,29 @@ export class VoiceService {
         const url = new URL(`${baseUrl}/audio/transcriptions`);
         const boundary = '----FormBoundary' + Math.random().toString(36).slice(2);
 
+        // Determine correct file extension from mimeType
+        // OpenAI uses filename extension to detect format
+        const extMap: Record<string, string> = {
+            'audio/webm': 'webm',
+            'audio/webm;codecs=opus': 'webm',
+            'audio/mp4': 'm4a',
+            'audio/mp4;codecs=mp4a.40.2': 'm4a',
+            'audio/ogg': 'ogg',
+            'audio/ogg;codecs=opus': 'ogg',
+            'audio/wav': 'wav',
+            'audio/mpeg': 'mp3',
+            'audio/flac': 'flac'
+        };
+        const ext = extMap[mimeType] || 'webm';
+        console.log(`Transcribe: mimeType=${mimeType}, using extension=${ext}`);
+
         // Build multipart form data
         const parts: Buffer[] = [];
 
         // Add file part
         parts.push(Buffer.from(
             `--${boundary}\r\n` +
-            `Content-Disposition: form-data; name="file"; filename="audio.webm"\r\n` +
+            `Content-Disposition: form-data; name="file"; filename="audio.${ext}"\r\n` +
             `Content-Type: ${mimeType}\r\n\r\n`
         ));
         parts.push(audioBuffer);

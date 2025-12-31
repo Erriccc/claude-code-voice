@@ -2254,7 +2254,12 @@ const getScript = (isTelemetryEnabled: boolean) => `<script>
 					addMessage(message.data, 'system');
 					updateStatusWithTotals();
 					break;
-					
+
+				case 'systemMessage':
+					// Display system message in chat (used for session codes, notifications, etc.)
+					addMessage(message.text, 'system');
+					break;
+
 				case 'restoreInputText':
 					const inputField = document.getElementById('messageInput');
 					if (inputField && message.data) {
@@ -3423,12 +3428,13 @@ const getScript = (isTelemetryEnabled: boolean) => `<script>
 
 		function updateSettings() {
 			// Note: thinking intensity is now handled separately in the thinking intensity modal
-			
+
 			const wslEnabled = document.getElementById('wsl-enabled').checked;
 			const wslDistro = document.getElementById('wsl-distro').value;
 			const wslNodePath = document.getElementById('wsl-node-path').value;
 			const wslClaudePath = document.getElementById('wsl-claude-path').value;
 			const yoloMode = document.getElementById('yolo-mode').checked;
+			const voiceInputMode = document.getElementById('voice-input-mode')?.value || 'auto';
 
 			// Update WSL options visibility
 			document.getElementById('wslOptions').style.display = wslEnabled ? 'block' : 'none';
@@ -3441,7 +3447,8 @@ const getScript = (isTelemetryEnabled: boolean) => `<script>
 					'wsl.distro': wslDistro || 'Ubuntu',
 					'wsl.nodePath': wslNodePath || '/usr/bin/node',
 					'wsl.claudePath': wslClaudePath || '/usr/local/bin/claude',
-					'permissions.yoloMode': yoloMode
+					'permissions.yoloMode': yoloMode,
+					'voice.inputMode': voiceInputMode
 				}
 			});
 		}
@@ -3650,10 +3657,16 @@ const getScript = (isTelemetryEnabled: boolean) => `<script>
 				document.getElementById('wsl-node-path').value = message.data['wsl.nodePath'] || '/usr/bin/node';
 				document.getElementById('wsl-claude-path').value = message.data['wsl.claudePath'] || '/usr/local/bin/claude';
 				document.getElementById('yolo-mode').checked = message.data['permissions.yoloMode'] || false;
-				
+
+				// Update voice input mode dropdown
+				const voiceInputModeEl = document.getElementById('voice-input-mode');
+				if (voiceInputModeEl) {
+					voiceInputModeEl.value = message.data['voice.inputMode'] || 'auto';
+				}
+
 				// Update yolo warning visibility
 				updateYoloWarning();
-				
+
 				// Show/hide WSL options
 				document.getElementById('wslOptions').style.display = message.data['wsl.enabled'] ? 'block' : 'none';
 			}

@@ -2,7 +2,7 @@
   "name": "claude-code-voice",
   "displayName": "Claude Code Voice",
   "description": "Voice-enabled Claude Code Chat Interface for VS Code with native mic recording and TTS",
-  "version": "1.1.1",
+  "version": "1.3.0",
   "publisher": "Fultonmarketaistudio",
   "author": "Fulton Market AI Studio",
   "repository": {
@@ -243,6 +243,16 @@
           "type": "boolean",
           "default": false,
           "description": "Automatically play Claude's responses as audio using TTS."
+        },
+        "claudeCodeChat.voice.inputMode": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "native",
+            "browser"
+          ],
+          "default": "auto",
+          "description": "Voice input mode. 'auto' tries native first then falls back to browser, 'native' uses Audify (requires local extension), 'browser' always uses browser popup (works in Codespaces)."
         }
       }
     }

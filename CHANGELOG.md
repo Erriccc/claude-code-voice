@@ -4,6 +4,68 @@ All notable changes to the "Claude Code Voice" extension will be documented in t
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [1.2.1] - 2025-12-31
+
+### 🐛 Bug Fixes
+- **Codespaces Support**: Fixed session URL detection for GitHub Codespaces
+  - Uses `vscode.env.asExternalUri()` for proper port forwarding URL resolution
+  - Browser voice mode now works correctly in Codespaces environments
+  - Session code and URL properly displayed in chat
+
+## [1.2.0] - 2025-12-31
+
+### 🔧 Major Cleanup - Single Server Architecture
+- **Removed VoicePopupServer**: Eliminated redundant HTTP server (was on port 9876)
+- **Now only ONE server runs**: VoiceBridgeServer on port 9877 for all browser voice needs
+- **Simplified voice stack**:
+  - VoiceService: STT/TTS via OpenAI API
+  - VoiceBridgeServer: Browser voice mode (port 9877)
+  - VoiceRecorder: Native mic via Audify (optional)
+- **No more confusion**: All browser voice input now uses the globe button → voice bridge
+
+### 🐛 Bug Fixes
+- Browser voice mode now receives Claude's responses
+- Claude's TTS responses are now sent to browser voice mode regardless of autoPlay setting
+
+## [1.1.5] - 2025-12-31
+
+### 🔧 Improvements
+- **Auto-kill stale server**: Server now automatically kills any existing process on port 9877 before starting
+- Works on macOS, Linux, and Windows
+- No more manual VS Code restarts needed when port is stuck
+
+## [1.1.4] - 2025-12-31
+
+### 🐛 Bug Fixes
+- **Fixed infinite retry loop**: Port conflict handling now only retries once instead of infinitely
+- Shows user-friendly warning when port is still in use after retry
+- Improved server lifecycle management
+
+## [1.1.3] - 2025-12-31
+
+### 🐛 Bug Fixes
+- **Voice Bridge Session Fix**: Fixed "Invalid or expired session code" error
+  - Added proper server cleanup on extension deactivation
+  - Added error handling for port conflicts
+  - Added debug logging for session connections
+- Fixed voice bridge server not stopping when extension reloads
+
+## [1.1.2] - 2025-12-30
+
+### 🎤 Voice Improvements
+- **Voice Input Mode Setting**: New setting to switch between voice input modes
+  - **Auto** (default): Tries native recording first, falls back to browser
+  - **Native only**: Forces native Audify recording
+  - **Browser only**: Always uses browser popup (recommended for Codespaces)
+- **Settings UI Toggle**: Voice input mode can now be changed in the Settings modal
+- **Fallback on Error**: When native recording fails, offers option to switch to browser mode
+
+### 🔧 Improvements
+- **Session Code Visibility**: Session code now shows in VS Code notification AND chat when starting browser voice mode
+  - VS Code notification with "Copy Code" button for easy copying
+  - System message in chat displays code and URL
+- Fixed issue where users couldn't see session code to enter in browser
+
 ## [1.1.0] - 2025-12-31
 
 ### 🎤 Voice Features

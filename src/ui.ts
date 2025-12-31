@@ -358,7 +358,27 @@ const getHtml = (isTelemetryEnabled: boolean) => `<!DOCTYPE html>
 					</div>
 				</div>
 
-				
+				<h3 style="margin-top: 24px; margin-bottom: 16px; font-size: 14px; font-weight: 600;">Voice Settings</h3>
+				<div>
+					<p style="font-size: 11px; color: var(--vscode-descriptionForeground); margin: 0;">
+						Configure how voice input is captured. Native mode uses your local microphone directly.
+						Browser mode opens a popup for voice input (works in Codespaces and remote environments).
+					</p>
+				</div>
+				<div class="settings-group">
+					<div style="margin-bottom: 12px;">
+						<label style="display: block; margin-bottom: 4px; font-size: 12px; color: var(--vscode-descriptionForeground);">Voice Input Mode</label>
+						<select id="voice-input-mode" class="file-search-input" style="width: 100%;" onchange="updateSettings()">
+							<option value="auto">Auto (try native first, fall back to browser)</option>
+							<option value="native">Native only (uses Audify/RtAudio)</option>
+							<option value="browser">Browser only (always open popup)</option>
+						</select>
+						<p style="font-size: 11px; color: var(--vscode-descriptionForeground); margin: 4px 0 0 0;">
+							Use "Browser only" if native recording isn't working or you're in a remote environment.
+						</p>
+					</div>
+				</div>
+
 			</div>
 		</div>
 	</div>
