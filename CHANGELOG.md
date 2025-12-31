@@ -1,8 +1,61 @@
 # Change Log
 
-All notable changes to the "claude-code-chat" extension will be documented in this file.
+All notable changes to the "Claude Code Voice" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
+
+## [1.1.0] - 2025-12-31
+
+### 🎤 Voice Features
+- **Persistent Browser Voice Mode**: New WebSocket-based voice bridge for continuous conversations
+  - Session code system (6-char alphanumeric)
+  - Browser tab stays open for ongoing voice chat
+  - TTS playback directly in browser
+  - Auto-expire sessions after 30 min inactivity
+- **New Browser Voice Button**: Globe icon in the UI to start browser voice mode
+- **Codespaces Improvements**: Server now binds to 0.0.0.0 for port forwarding compatibility
+- **Dynamic URL Detection**: Automatically constructs correct forwarded URL in Codespaces
+
+### 🔧 Technical Improvements
+- Added VoiceBridgeServer with SSE for real-time updates
+- Improved error handling and logging for browser popup fallback
+- Updated VOICE_PRD.md with persistent browser mode architecture
+
+## [1.0.2] - 2025-12-30
+
+### 🐛 Bug Fixes
+- Fixed Codespaces compatibility - server now listens on 0.0.0.0
+- Automatic Codespaces URL detection using environment variables
+- Better error messages in browser popup for debugging
+
+## [1.0.1] - 2025-12-30
+
+### 🐛 Bug Fixes
+- Fixed native module bundling - node_modules now included in vsix
+- Added graceful fallback when sound-play fails to load
+- Extension no longer crashes on startup in remote environments
+
+## [1.0.0] - 2025-12-30
+
+### 🎤 Voice Features (New!)
+- **Native Microphone Recording**: Using Audify (RtAudio) - no external dependencies
+- **Dynamic Sample Rate Detection**: Automatically uses device's preferred sample rate
+- **Silence Detection (VAD)**: Auto-stops recording after 1.5s of silence
+- **OpenAI Whisper Integration**: Speech-to-text transcription
+- **OpenAI TTS Integration**: Text-to-speech for Claude's responses
+- **Native Audio Playback**: Using sound-play (bypasses webview autoplay restrictions)
+- **Browser Popup Fallback**: For Codespaces and VS Code Web
+- **Local TTS/STT Options**: Whisper.cpp and Kokoro TTS support
+
+### 📝 Configuration
+- `claudeCodeChat.voice.sttProvider`: Choose OpenAI or local Whisper
+- `claudeCodeChat.voice.ttsProvider`: Choose OpenAI or local Kokoro
+- `claudeCodeChat.voice.openaiApiKey`: API key for voice services
+- `claudeCodeChat.voice.autoPlayResponses`: Auto-play Claude's responses
+
+---
+
+## Previous Versions (Base Extension)
 
 ## [1.1.0] - 2025-12-06
 

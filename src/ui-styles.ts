@@ -1594,6 +1594,48 @@ const styles = `
         color: #64ffda;
     }
 
+    .tts-controls {
+        display: flex;
+        gap: 8px;
+        margin: 8px 0;
+        flex-wrap: wrap;
+    }
+
+    .tts-controls button {
+        padding: 6px 12px;
+        border-radius: 6px;
+        cursor: pointer;
+        font-size: 12px;
+        font-weight: 500;
+        transition: all 0.2s ease;
+    }
+
+    .tts-mute-btn {
+        background-color: rgba(255, 152, 0, 0.15);
+        color: #ff9800;
+        border: 1px solid rgba(255, 152, 0, 0.3);
+    }
+
+    .tts-mute-btn:hover {
+        background-color: rgba(255, 152, 0, 0.25);
+    }
+
+    .tts-stop-btn {
+        background-color: rgba(244, 67, 54, 0.15);
+        color: #f44336;
+        border: 1px solid rgba(244, 67, 54, 0.3);
+    }
+
+    .tts-stop-btn:hover {
+        background-color: rgba(244, 67, 54, 0.25);
+    }
+
+    .global-mute-indicator {
+        color: #ff9800;
+        font-size: 12px;
+        margin-left: 8px;
+    }
+
     .tts-play-btn {
         background-color: rgba(76, 175, 80, 0.15);
         color: #4CAF50;

@@ -854,6 +854,38 @@ const getScript = (isTelemetryEnabled: boolean) => `<script>
 		let audioContext = null;
 		let audioUnlocked = false;
 
+		// Audio playback state for mute/pause controls
+		let currentAudio = null;
+		let audioMuted = false;
+		let audioQueue = [];
+
+		// Update mute indicator in UI
+		function updateMuteIndicator() {
+			const muteIndicator = document.getElementById('globalMuteIndicator');
+			if (muteIndicator) {
+				muteIndicator.style.display = audioMuted ? 'inline' : 'none';
+			}
+			// Also update all mute buttons in the chat
+			document.querySelectorAll('.tts-mute-btn').forEach(btn => {
+				btn.innerHTML = audioMuted ? '🔇 Unmute' : '🔊 Mute';
+			});
+			// Update current audio volume
+			if (currentAudio) {
+				currentAudio.volume = audioMuted ? 0 : 1.0;
+			}
+		}
+
+		// Global function to toggle mute from header
+		function toggleGlobalMute() {
+			audioMuted = !audioMuted;
+			updateMuteIndicator();
+			// Stop current audio if muting
+			if (audioMuted && currentAudio && !currentAudio.paused) {
+				currentAudio.pause();
+			}
+		}
+		window.toggleGlobalMute = toggleGlobalMute;
+
 		// Unlock audio context on user gesture (voice button click)
 		function unlockAudioContext() {
 			if (audioUnlocked) return;
@@ -2249,6 +2281,8 @@ const getScript = (isTelemetryEnabled: boolean) => `<script>
 					console.log('Audio data length:', message.audio?.length);
 					console.log('MIME type:', message.mimeType);
 					console.log('Audio context unlocked:', audioUnlocked);
+					console.log('Audio muted:', audioMuted);
+
 					if (message.audio && message.mimeType) {
 						try {
 							const audioUrl = 'data:' + message.mimeType + ';base64,' + message.audio;
@@ -2256,37 +2290,82 @@ const getScript = (isTelemetryEnabled: boolean) => `<script>
 
 							// Create audio element
 							const audio = new Audio();
-							audio.volume = 1.0;
+							audio.volume = audioMuted ? 0 : 1.0;
+							currentAudio = audio;
 
-							// Function to add play button to the latest Claude message
-							const addPlayButton = () => {
+							// Function to add play/pause/mute controls to the latest Claude message
+							const addAudioControls = () => {
 								const messages = document.querySelectorAll('.message.claude');
 								const lastMessage = messages[messages.length - 1];
-								if (lastMessage && !lastMessage.querySelector('.tts-play-btn')) {
+								if (lastMessage && !lastMessage.querySelector('.tts-controls')) {
+									const controlsDiv = document.createElement('div');
+									controlsDiv.className = 'tts-controls';
+
+									// Play/Pause button
 									const playBtn = document.createElement('button');
 									playBtn.className = 'tts-play-btn';
-									playBtn.innerHTML = '🔊 Play Response';
-									playBtn.title = 'Click to play audio response';
+									playBtn.innerHTML = '▶️ Play';
+									playBtn.title = 'Play/Pause audio response';
 									playBtn.onclick = () => {
-										// Unlock on click as user gesture
 										unlockAudioContext();
-										audio.play()
-											.then(() => {
-												playBtn.innerHTML = '🔊 Playing...';
-												playBtn.disabled = true;
-											})
-											.catch(e => console.error('Manual play failed:', e));
+										if (audio.paused) {
+											audio.play()
+												.then(() => {
+													playBtn.innerHTML = '⏸️ Pause';
+												})
+												.catch(e => console.error('Play failed:', e));
+										} else {
+											audio.pause();
+											playBtn.innerHTML = '▶️ Play';
+										}
 									};
+
+									// Mute/Unmute button
+									const muteBtn = document.createElement('button');
+									muteBtn.className = 'tts-mute-btn';
+									muteBtn.innerHTML = audioMuted ? '🔇 Unmute' : '🔊 Mute';
+									muteBtn.title = 'Toggle audio mute';
+									muteBtn.onclick = () => {
+										audioMuted = !audioMuted;
+										audio.volume = audioMuted ? 0 : 1.0;
+										muteBtn.innerHTML = audioMuted ? '🔇 Unmute' : '🔊 Mute';
+										// Update global mute state indicator
+										updateMuteIndicator();
+									};
+
+									// Stop button
+									const stopBtn = document.createElement('button');
+									stopBtn.className = 'tts-stop-btn';
+									stopBtn.innerHTML = '⏹️ Stop';
+									stopBtn.title = 'Stop audio playback';
+									stopBtn.onclick = () => {
+										audio.pause();
+										audio.currentTime = 0;
+										playBtn.innerHTML = '▶️ Play';
+									};
+
+									controlsDiv.appendChild(playBtn);
+									controlsDiv.appendChild(muteBtn);
+									controlsDiv.appendChild(stopBtn);
+
 									audio.onended = () => {
-										playBtn.innerHTML = '🔊 Play Again';
-										playBtn.disabled = false;
+										playBtn.innerHTML = '▶️ Play Again';
 									};
+									audio.onplay = () => {
+										playBtn.innerHTML = '⏸️ Pause';
+									};
+									audio.onpause = () => {
+										if (audio.currentTime < audio.duration) {
+											playBtn.innerHTML = '▶️ Resume';
+										}
+									};
+
 									// Insert after the message header
 									const header = lastMessage.querySelector('.message-header');
 									if (header) {
-										header.after(playBtn);
+										header.after(controlsDiv);
 									} else {
-										lastMessage.prepend(playBtn);
+										lastMessage.prepend(controlsDiv);
 									}
 								}
 							};
@@ -2294,17 +2373,29 @@ const getScript = (isTelemetryEnabled: boolean) => `<script>
 							// Set up event handlers before setting src
 							audio.oncanplaythrough = () => {
 								console.log('Audio can play through, attempting play...');
+								// Check if muted before auto-playing
+								if (audioMuted) {
+									console.log('Audio muted, showing controls without autoplay');
+									addAudioControls();
+									return;
+								}
 								// VS Code 1.86+ disabled UnifiedAutoplay - just try to play directly!
 								audio.play()
-									.then(() => console.log('Audio play() succeeded! (autoplay worked)'))
+									.then(() => {
+										console.log('Audio play() succeeded! (autoplay worked)');
+										addAudioControls();
+									})
 									.catch(err => {
 										console.error('Audio play() failed:', err.name, err.message);
 										// Only show play button if autoplay truly fails
-										addPlayButton();
+										addAudioControls();
 									});
 							};
 							audio.onplay = () => console.log('Audio onplay event fired');
-							audio.onended = () => console.log('Audio playback finished');
+							audio.onended = () => {
+								console.log('Audio playback finished');
+								currentAudio = null;
+							};
 							audio.onerror = (e) => console.error('Audio error event:', e);
 							audio.onloadeddata = () => console.log('Audio data loaded');
 
