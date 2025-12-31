@@ -55,8 +55,9 @@ export class VoicePopupServer {
             }
         });
 
-        this.httpServer.listen(POPUP_PORT, '127.0.0.1', () => {
-            console.log(`Voice capture server running at http://127.0.0.1:${POPUP_PORT}`);
+        // Listen on 0.0.0.0 to accept connections from forwarded ports (Codespaces)
+        this.httpServer.listen(POPUP_PORT, '0.0.0.0', () => {
+            console.log(`Voice capture server running on port ${POPUP_PORT}`);
         });
     }
 
@@ -65,7 +66,21 @@ export class VoicePopupServer {
     }
 
     openVoiceCapture(): void {
-        const url = `http://127.0.0.1:${POPUP_PORT}`;
+        // In Codespaces, use the forwarded URL; locally use localhost
+        const isCodespaces = process.env.CODESPACES === 'true';
+        const codespaceName = process.env.CODESPACE_NAME;
+        const githubCodespacesPortForwardingDomain = process.env.GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN;
+
+        let url: string;
+        if (isCodespaces && codespaceName && githubCodespacesPortForwardingDomain) {
+            // Codespaces forwarded URL format
+            url = `https://${codespaceName}-${POPUP_PORT}.${githubCodespacesPortForwardingDomain}`;
+            console.log('Opening voice capture in Codespaces:', url);
+        } else {
+            url = `http://127.0.0.1:${POPUP_PORT}`;
+            console.log('Opening voice capture locally:', url);
+        }
+
         vscode.env.openExternal(vscode.Uri.parse(url));
     }
 
@@ -406,34 +421,50 @@ export class VoicePopupServer {
 
         async function sendAudioForTranscription(audioBlob, mimeType) {
             try {
+                status.textContent = 'Sending audio...';
+                console.log('Sending audio, size:', audioBlob.size, 'type:', mimeType);
+
                 const reader = new FileReader();
                 reader.onloadend = async () => {
                     const base64 = reader.result.split(',')[1];
+                    console.log('Audio encoded, base64 length:', base64.length);
 
-                    const response = await fetch('/transcribe', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            audio: base64,
-                            mimeType: mimeType
-                        })
-                    });
+                    try {
+                        const response = await fetch('/transcribe', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                audio: base64,
+                                mimeType: mimeType
+                            })
+                        });
 
-                    const result = await response.json();
+                        console.log('Response status:', response.status);
 
-                    if (result.success) {
-                        transcriptText.textContent = result.text;
-                        transcriptBox.style.display = 'block';
-                        status.textContent = 'Sent to Claude Code!';
-                        micButton.classList.remove('processing');
-                        micIcon.textContent = '✓';
+                        if (!response.ok) {
+                            throw new Error('Server returned ' + response.status + ': ' + response.statusText);
+                        }
 
-                        // Auto-close after delay
-                        setTimeout(() => {
-                            window.close();
-                        }, 2000);
-                    } else {
-                        showError(result.error || 'Transcription failed');
+                        const result = await response.json();
+                        console.log('Response result:', result);
+
+                        if (result.success) {
+                            transcriptText.textContent = result.text;
+                            transcriptBox.style.display = 'block';
+                            status.textContent = 'Sent to Claude Code!';
+                            micButton.classList.remove('processing');
+                            micIcon.textContent = '✓';
+
+                            // Auto-close after delay
+                            setTimeout(() => {
+                                window.close();
+                            }, 2000);
+                        } else {
+                            showError(result.error || 'Transcription failed');
+                        }
+                    } catch (fetchError) {
+                        console.error('Fetch error:', fetchError);
+                        showError('Connection error: ' + fetchError.message + '. Make sure the port is public in Codespaces.');
                     }
                 };
                 reader.readAsDataURL(audioBlob);
