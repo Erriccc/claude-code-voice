@@ -328,6 +328,10 @@ class ClaudeChatProvider {
 					this._voiceBridge.sendStreamingAudio(audioBase64, text, isLast);
 				}
 			},
+			isBrowserConnected: () => {
+				// Check if browser voice bridge has an active session
+				return this._voiceBridge?.hasActiveSession() ?? false;
+			},
 			onWebviewAudio: (audioBase64, mimeType) => {
 				// Send to webview for playback
 				this._postMessage({
@@ -470,14 +474,10 @@ class ClaudeChatProvider {
 
 		// Check if TTS is enabled
 		const config = vscode.workspace.getConfiguration('claudeCodeChat');
-		const autoPlay = config.get<boolean>('voice.autoPlayResponses', false);
+		const autoPlay = config.get<boolean>('voice.autoPlayResponses', true);
 		const hasBrowserBridge = this._voiceBridge?.hasActiveSession();
 
-		// Skip if auto-play disabled AND no browser bridge connected
-		if (!autoPlay && !hasBrowserBridge) {
-			console.log('Auto-play disabled and no browser bridge, skipping TTS');
-			return;
-		}
+		console.log('TTS config: autoPlay=', autoPlay, 'browserBridge=', hasBrowserBridge);
 
 		// Use streaming TTS manager if available
 		if (this._streamingTTS) {

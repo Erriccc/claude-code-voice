@@ -33,6 +33,8 @@ export interface TTSQueueItem {
 export interface StreamingTTSOptions {
     /** Callback to send audio to browser voice bridge */
     onBrowserAudio?: (audioBase64: string, text: string, isLast: boolean) => void;
+    /** Check if browser bridge is connected (determines whether to use browser or webview) */
+    isBrowserConnected?: () => boolean;
     /** Callback to send audio to webview */
     onWebviewAudio?: (audioBase64: string, mimeType: string) => void;
     /** Callback when playback state changes */
@@ -207,18 +209,18 @@ export class StreamingTTSManager {
                 );
 
                 const isLast = this.currentIndex === this.queue.length - 1;
+                const browserConnected = this.options.isBrowserConnected?.() ?? false;
 
-                // Send to browser bridge if callback provided
-                if (this.options.onBrowserAudio) {
+                // Determine playback target
+                if (browserConnected && this.options.onBrowserAudio) {
+                    // Browser bridge is connected - send to browser
                     const base64 = item.audioBuffer.toString('base64');
                     this.options.onBrowserAudio(base64, item.text, isLast);
-                }
-
-                // Play natively if available
-                if (soundPlay && !this.options.onBrowserAudio) {
+                } else if (soundPlay) {
+                    // Native playback available - play locally
                     await this.playNatively(item.audioBuffer);
-                } else if (this.options.onWebviewAudio && !this.options.onBrowserAudio) {
-                    // Send to webview if no browser bridge
+                } else if (this.options.onWebviewAudio) {
+                    // Send to webview
                     const base64 = item.audioBuffer.toString('base64');
                     this.options.onWebviewAudio(base64, 'audio/mp3');
                 }

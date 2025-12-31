@@ -145,19 +145,42 @@ export class VoiceBridgeServer {
     /**
      * Kill any existing process on the bridge port
      */
-    private killExistingProcess(): void {
+    private killExistingProcess(): boolean {
         try {
             const platform = process.platform;
             if (platform === 'darwin' || platform === 'linux') {
-                // macOS/Linux: Use lsof to find and kill process
-                execSync(`lsof -ti:${BRIDGE_PORT} | xargs kill -9 2>/dev/null || true`, { stdio: 'ignore' });
+                // macOS/Linux: Use lsof to find and kill process - try multiple times
+                for (let i = 0; i < 3; i++) {
+                    try {
+                        const result = execSync(`lsof -ti:${BRIDGE_PORT} 2>/dev/null || true`, { encoding: 'utf-8' });
+                        const pids = result.trim().split('\n').filter(p => p);
+                        if (pids.length === 0) {
+                            console.log(`Port ${BRIDGE_PORT} is free`);
+                            return true;
+                        }
+                        console.log(`Found processes on port ${BRIDGE_PORT}: ${pids.join(', ')}`);
+                        for (const pid of pids) {
+                            try {
+                                execSync(`kill -9 ${pid} 2>/dev/null || true`, { stdio: 'ignore' });
+                            } catch (e) {
+                                // Ignore
+                            }
+                        }
+                        // Wait a bit for the port to be released
+                        execSync('sleep 0.5', { stdio: 'ignore' });
+                    } catch (e) {
+                        // Ignore
+                    }
+                }
             } else if (platform === 'win32') {
                 // Windows: Use netstat and taskkill
                 execSync(`for /f "tokens=5" %a in ('netstat -aon ^| findstr :${BRIDGE_PORT}') do taskkill /F /PID %a 2>nul`, { stdio: 'ignore', shell: 'cmd.exe' });
             }
             console.log(`Cleared any existing process on port ${BRIDGE_PORT}`);
+            return true;
         } catch (e) {
-            // Ignore errors - port might not be in use
+            console.log(`Could not clear port ${BRIDGE_PORT}:`, e);
+            return false;
         }
     }
 
@@ -442,6 +465,7 @@ export class VoiceBridgeServer {
 
     /**
      * Send permission request to browser for voice/button approval
+     * Queues multiple permissions and shows one at a time
      */
     sendPermissionRequest(request: {
         id: string;
@@ -453,34 +477,62 @@ export class VoiceBridgeServer {
         if (this.currentSessionCode) {
             const session = this.sessions.get(this.currentSessionCode);
             if (session && session.connected) {
-                // Track pending permission for voice responses
-                this.pendingPermissionId = request.id;
-
-                // Send permission request event
-                this.sendToSession(this.currentSessionCode, 'permissionRequest', {
+                // Add to queue
+                this.pendingPermissions.push({
                     id: request.id,
                     tool: request.tool,
-                    prompt: request.prompt,
-                    input: request.input,
-                    pattern: request.pattern
+                    prompt: request.prompt
                 });
 
-                // Also speak the permission request via TTS
-                this.voiceService.synthesize(request.prompt + '. Say yes to allow or no to deny.')
-                    .then(audioBuffer => {
-                        if (audioBuffer) {
-                            const base64Audio = audioBuffer.toString('base64');
-                            this.sendToSession(this.currentSessionCode!, 'tts', {
-                                audio: base64Audio,
-                                mimeType: 'audio/mp3',
-                                text: request.prompt,
-                                isPermission: true
-                            });
-                        }
-                    })
-                    .catch(err => console.error('Permission TTS error:', err));
+                // Send full queue to browser (for batch operations and UI)
+                this.sendToSession(this.currentSessionCode, 'permissionQueue', {
+                    count: this.pendingPermissions.length,
+                    queue: this.pendingPermissions.map(p => ({
+                        id: p.id,
+                        tool: p.tool,
+                        prompt: p.prompt
+                    })),
+                    current: this.pendingPermissions[0]
+                });
+
+                // Only speak/show if this is the first (current) permission
+                if (this.pendingPermissions.length === 1) {
+                    this.showCurrentPermission();
+                }
             }
         }
+    }
+
+    /**
+     * Show the current (first) permission in the queue
+     */
+    private showCurrentPermission(): void {
+        if (this.pendingPermissions.length === 0 || !this.currentSessionCode) return;
+
+        const current = this.pendingPermissions[0];
+
+        // Send permission request event to browser
+        this.sendToSession(this.currentSessionCode, 'permissionRequest', {
+            id: current.id,
+            tool: current.tool,
+            prompt: current.prompt,
+            queueCount: this.pendingPermissions.length
+        });
+
+        // Queue TTS for permission (don't interrupt if audio is playing)
+        this.voiceService.synthesize(current.prompt + '. Say yes or no.')
+            .then(audioBuffer => {
+                if (audioBuffer) {
+                    const base64Audio = audioBuffer.toString('base64');
+                    this.sendToSession(this.currentSessionCode!, 'permissionAudio', {
+                        audio: base64Audio,
+                        mimeType: 'audio/mp3',
+                        text: current.prompt,
+                        id: current.id
+                    });
+                }
+            })
+            .catch(err => console.error('Permission TTS error:', err));
     }
 
     /**
@@ -602,8 +654,8 @@ export class VoiceBridgeServer {
 
                 console.log('Permission response from browser:', { requestId, approved, alwaysAllow });
 
-                // Forward to the callback
-                this.handlePermissionResponse(approved, requestId, alwaysAllow || false);
+                // Handle permission and advance to next in queue
+                this.handlePermissionAndAdvance(requestId, approved, alwaysAllow || false);
 
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ success: true }));
@@ -615,38 +667,105 @@ export class VoiceBridgeServer {
     }
 
     /**
-     * Track pending permission request ID for voice responses
+     * Queue of pending permission requests for voice responses
      */
-    private pendingPermissionId: string | null = null;
+    private pendingPermissions: Array<{
+        id: string;
+        tool: string;
+        prompt: string;
+    }> = [];
 
     /**
-     * Check if transcript is a permission response (yes/no)
+     * Check if transcript is a permission response (yes/no/always/allow all)
      */
     private checkForPermissionResponse(transcript: string): boolean {
-        if (!this.pendingPermissionId) return false;
+        if (this.pendingPermissions.length === 0) return false;
 
         const lower = transcript.toLowerCase().trim();
 
-        // Check for approval phrases
+        // Check for "always allow" first (more specific)
+        const alwaysAllowPhrases = ['always allow', 'always yes', 'allow always', 'always approve'];
+        const isAlwaysAllow = alwaysAllowPhrases.some(phrase => lower.includes(phrase));
+
+        // Check for "allow all" (batch operation)
+        const allowAllPhrases = ['allow all', 'yes to all', 'approve all', 'accept all'];
+        const isAllowAll = allowAllPhrases.some(phrase => lower.includes(phrase));
+
+        // Check for "deny all" (batch operation)
+        const denyAllPhrases = ['deny all', 'no to all', 'reject all', 'cancel all'];
+        const isDenyAll = denyAllPhrases.some(phrase => lower.includes(phrase));
+
+        // Check for simple approval phrases
         const approvalPhrases = ['yes', 'yeah', 'yep', 'approve', 'allow', 'go ahead', 'do it', 'okay', 'ok'];
         const denialPhrases = ['no', 'nope', 'deny', 'stop', 'cancel', 'don\'t', 'reject'];
 
         const isApproval = approvalPhrases.some(phrase => lower.includes(phrase));
         const isDenial = denialPhrases.some(phrase => lower.includes(phrase));
 
-        if (isApproval && !isDenial) {
-            console.log('Voice permission approved:', this.pendingPermissionId);
-            this.handlePermissionResponse(true, this.pendingPermissionId, false);
-            this.pendingPermissionId = null;
+        const current = this.pendingPermissions[0];
+
+        if (isAllowAll) {
+            // Approve all queued permissions
+            console.log('Voice: Allow all permissions');
+            const allIds = this.pendingPermissions.map(p => p.id);
+            for (const id of allIds) {
+                this.handlePermissionAndAdvance(id, true, false);
+            }
+            return true;
+        } else if (isDenyAll) {
+            // Deny all queued permissions
+            console.log('Voice: Deny all permissions');
+            const allIds = this.pendingPermissions.map(p => p.id);
+            for (const id of allIds) {
+                this.handlePermissionAndAdvance(id, false, false);
+            }
+            return true;
+        } else if (isAlwaysAllow) {
+            console.log('Voice permission always allow:', current.id);
+            this.handlePermissionAndAdvance(current.id, true, true);
+            return true;
+        } else if (isApproval && !isDenial) {
+            console.log('Voice permission approved:', current.id);
+            this.handlePermissionAndAdvance(current.id, true, false);
             return true;
         } else if (isDenial && !isApproval) {
-            console.log('Voice permission denied:', this.pendingPermissionId);
-            this.handlePermissionResponse(false, this.pendingPermissionId, false);
-            this.pendingPermissionId = null;
+            console.log('Voice permission denied:', current.id);
+            this.handlePermissionAndAdvance(current.id, false, false);
             return true;
         }
 
         return false;
+    }
+
+    /**
+     * Handle permission response and advance to next in queue
+     */
+    private handlePermissionAndAdvance(requestId: string, approved: boolean, alwaysAllow: boolean): void {
+        // Remove from queue
+        const index = this.pendingPermissions.findIndex(p => p.id === requestId);
+        if (index !== -1) {
+            this.pendingPermissions.splice(index, 1);
+        }
+
+        // Send response to extension
+        if (this.onPermissionResponse) {
+            this.onPermissionResponse(requestId, approved, alwaysAllow);
+        }
+
+        // Notify browser of queue update
+        if (this.currentSessionCode) {
+            this.sendToSession(this.currentSessionCode, 'permissionHandled', {
+                id: requestId,
+                approved: approved,
+                remaining: this.pendingPermissions.length
+            });
+
+            // Show next permission if any
+            if (this.pendingPermissions.length > 0) {
+                // Small delay before showing next
+                setTimeout(() => this.showCurrentPermission(), 500);
+            }
+        }
     }
 
     /**
@@ -1005,16 +1124,17 @@ export class VoiceBridgeServer {
         }
         .permission-buttons {
             display: flex;
-            gap: 12px;
+            gap: 10px;
             justify-content: center;
             flex-wrap: wrap;
+            margin-bottom: 12px;
         }
         .permission-btn {
-            padding: 12px 28px;
-            font-size: 16px;
+            padding: 10px 20px;
+            font-size: 14px;
             font-weight: 600;
             border: none;
-            border-radius: 25px;
+            border-radius: 20px;
             cursor: pointer;
             transition: all 0.3s ease;
         }
@@ -1026,6 +1146,14 @@ export class VoiceBridgeServer {
             transform: scale(1.05);
             box-shadow: 0 5px 20px rgba(100, 255, 218, 0.4);
         }
+        .permission-btn.always {
+            background: linear-gradient(145deg, #6c5ce7, #5849c2);
+            color: white;
+        }
+        .permission-btn.always:hover {
+            transform: scale(1.05);
+            box-shadow: 0 5px 20px rgba(108, 92, 231, 0.4);
+        }
         .permission-btn.deny {
             background: linear-gradient(145deg, #e94560, #c73e54);
             color: white;
@@ -1034,10 +1162,63 @@ export class VoiceBridgeServer {
             transform: scale(1.05);
             box-shadow: 0 5px 20px rgba(233, 69, 96, 0.4);
         }
+        .permission-secondary-row {
+            display: flex;
+            gap: 10px;
+            justify-content: center;
+            margin-top: 10px;
+        }
+        .permission-btn.allow-all {
+            background: linear-gradient(145deg, #00b894, #00a085);
+            color: white;
+            padding: 8px 16px;
+            font-size: 13px;
+        }
+        .permission-btn.allow-all:hover {
+            transform: scale(1.05);
+            box-shadow: 0 5px 20px rgba(0, 184, 148, 0.4);
+        }
+        .permission-btn.deny-all {
+            background: linear-gradient(145deg, #636e72, #545e61);
+            color: white;
+            padding: 8px 16px;
+            font-size: 13px;
+        }
+        .permission-btn.deny-all:hover {
+            transform: scale(1.05);
+            box-shadow: 0 5px 15px rgba(99, 110, 114, 0.4);
+        }
         .permission-hint {
             font-size: 12px;
             color: #8892b0;
-            margin-top: 16px;
+            margin-top: 14px;
+        }
+        .permission-badge {
+            position: absolute;
+            top: -10px;
+            right: -10px;
+            background: #e94560;
+            color: white;
+            font-size: 14px;
+            font-weight: bold;
+            padding: 6px 10px;
+            border-radius: 15px;
+            min-width: 24px;
+            text-align: center;
+            box-shadow: 0 2px 10px rgba(233, 69, 96, 0.5);
+        }
+        .permission-card {
+            position: relative;
+        }
+        .permission-listening {
+            color: #64ffda;
+            animation: pulse 1s ease-in-out infinite;
+        }
+        .permission-queue-info {
+            font-size: 11px;
+            color: #ffd93d;
+            margin-top: 8px;
+            opacity: 0.9;
         }
     </style>
 </head>
@@ -1084,15 +1265,22 @@ export class VoiceBridgeServer {
         <!-- Permission Request Overlay -->
         <div class="permission-overlay hidden" id="permissionOverlay">
             <div class="permission-card">
+                <div class="permission-badge hidden" id="permissionBadge">1</div>
                 <div class="permission-icon">⚠️</div>
                 <div class="permission-title">Permission Required</div>
                 <div class="permission-tool" id="permissionTool">Tool: Bash</div>
                 <div class="permission-prompt" id="permissionPrompt">Run command: ls -la</div>
                 <div class="permission-buttons">
                     <button class="permission-btn approve" id="permissionApprove">✓ Allow</button>
+                    <button class="permission-btn always" id="permissionAlways">✓ Always Allow</button>
                     <button class="permission-btn deny" id="permissionDeny">✗ Deny</button>
                 </div>
-                <div class="permission-hint">Or say "yes" / "no" to respond by voice</div>
+                <div class="permission-secondary-row hidden" id="permissionBatchRow">
+                    <button class="permission-btn allow-all" id="permissionAllowAll">✓ Allow All</button>
+                    <button class="permission-btn deny-all" id="permissionDenyAll">✗ Deny All</button>
+                </div>
+                <div class="permission-queue-info hidden" id="permissionQueueInfo"></div>
+                <div class="permission-hint">🎤 Say: "yes" • "no" • "always allow" • "allow all" • Press Space to record</div>
             </div>
         </div>
     </div>
@@ -1112,6 +1300,10 @@ export class VoiceBridgeServer {
         let isPlayingAudio = false;
         let currentAudioElement = null;
 
+        // Permission queue tracking
+        let permissionQueue = [];
+        let permissionAudioQueue = [];
+
         // DOM elements
         const connectSection = document.getElementById('connectSection');
         const voiceSection = document.getElementById('voiceSection');
@@ -1128,7 +1320,13 @@ export class VoiceBridgeServer {
         const permissionTool = document.getElementById('permissionTool');
         const permissionPrompt = document.getElementById('permissionPrompt');
         const permissionApprove = document.getElementById('permissionApprove');
+        const permissionAlways = document.getElementById('permissionAlways');
         const permissionDeny = document.getElementById('permissionDeny');
+        const permissionAllowAll = document.getElementById('permissionAllowAll');
+        const permissionDenyAll = document.getElementById('permissionDenyAll');
+        const permissionBadge = document.getElementById('permissionBadge');
+        const permissionBatchRow = document.getElementById('permissionBatchRow');
+        const permissionQueueInfo = document.getElementById('permissionQueueInfo');
 
         // Playback control elements
         const stopBtn = document.getElementById('stopBtn');
@@ -1249,6 +1447,14 @@ export class VoiceBridgeServer {
                 }
             });
 
+            // Handle permission queue updates
+            eventSource.addEventListener('permissionQueue', (e) => {
+                const data = JSON.parse(e.data);
+                console.log('Permission queue update:', data);
+                permissionQueue = data.queue || [];
+                updatePermissionUI();
+            });
+
             // Handle permission request from VS Code
             eventSource.addEventListener('permissionRequest', (e) => {
                 const data = JSON.parse(e.data);
@@ -1256,10 +1462,28 @@ export class VoiceBridgeServer {
                 showPermission(data);
             });
 
-            // Handle permission handled (via voice)
+            // Handle permission audio (queued separately, plays after current audio)
+            eventSource.addEventListener('permissionAudio', (e) => {
+                const data = JSON.parse(e.data);
+                console.log('Permission audio received for:', data.id);
+                // Queue permission audio - it will play after any current TTS
+                if (data.audio) {
+                    queueAudio(data.audio, data.mimeType || 'audio/mp3', true, true);
+                }
+            });
+
+            // Handle permission handled (via voice or button)
             eventSource.addEventListener('permissionHandled', (e) => {
-                console.log('Permission handled via voice');
-                hidePermission();
+                const data = JSON.parse(e.data);
+                console.log('Permission handled:', data);
+                // Remove from local queue
+                permissionQueue = permissionQueue.filter(p => p.id !== data.id);
+                // If no more permissions, hide overlay
+                if (data.remaining === 0 || permissionQueue.length === 0) {
+                    hidePermission();
+                } else {
+                    updatePermissionUI();
+                }
             });
 
             // Handle playback control from server
@@ -1376,15 +1600,50 @@ export class VoiceBridgeServer {
             if (permissionPrompt) permissionPrompt.textContent = data.prompt;
             if (permissionOverlay) permissionOverlay.classList.remove('hidden');
             if (voiceStatus) voiceStatus.textContent = 'Permission required - respond by voice or buttons';
+            updatePermissionUI();
+        }
+
+        function updatePermissionUI() {
+            const queueCount = permissionQueue.length || (currentPermissionId ? 1 : 0);
+
+            // Update badge
+            if (permissionBadge) {
+                if (queueCount > 1) {
+                    permissionBadge.textContent = queueCount.toString();
+                    permissionBadge.classList.remove('hidden');
+                } else {
+                    permissionBadge.classList.add('hidden');
+                }
+            }
+
+            // Show/hide batch buttons
+            if (permissionBatchRow) {
+                if (queueCount > 1) {
+                    permissionBatchRow.classList.remove('hidden');
+                } else {
+                    permissionBatchRow.classList.add('hidden');
+                }
+            }
+
+            // Update queue info
+            if (permissionQueueInfo) {
+                if (queueCount > 1) {
+                    permissionQueueInfo.textContent = queueCount + ' permissions pending';
+                    permissionQueueInfo.classList.remove('hidden');
+                } else {
+                    permissionQueueInfo.classList.add('hidden');
+                }
+            }
         }
 
         function hidePermission() {
             currentPermissionId = null;
+            permissionQueue = [];
             if (permissionOverlay) permissionOverlay.classList.add('hidden');
             if (voiceStatus) voiceStatus.textContent = 'Click or press Space to speak';
         }
 
-        async function sendPermissionResponse(approved) {
+        async function sendPermissionResponse(approved, alwaysAllow = false) {
             if (!currentPermissionId) return;
 
             try {
@@ -1397,21 +1656,55 @@ export class VoiceBridgeServer {
                     body: JSON.stringify({
                         requestId: currentPermissionId,
                         approved: approved,
-                        alwaysAllow: false
+                        alwaysAllow: alwaysAllow
                     })
                 });
-                hidePermission();
+                // Don't hide yet - wait for permissionHandled event with remaining count
             } catch (error) {
                 console.error('Permission response error:', error);
             }
         }
 
+        async function sendBatchPermissionResponse(approved) {
+            // Send responses for all queued permissions
+            const idsToProcess = [currentPermissionId, ...permissionQueue.map(p => p.id)].filter(Boolean);
+
+            for (const id of idsToProcess) {
+                try {
+                    await fetch('/permission', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-Session-Token': sessionToken
+                        },
+                        body: JSON.stringify({
+                            requestId: id,
+                            approved: approved,
+                            alwaysAllow: false
+                        })
+                    });
+                } catch (error) {
+                    console.error('Batch permission response error:', error);
+                }
+            }
+            hidePermission();
+        }
+
         // Permission button handlers
         if (permissionApprove) {
-            permissionApprove.addEventListener('click', () => sendPermissionResponse(true));
+            permissionApprove.addEventListener('click', () => sendPermissionResponse(true, false));
+        }
+        if (permissionAlways) {
+            permissionAlways.addEventListener('click', () => sendPermissionResponse(true, true));
         }
         if (permissionDeny) {
-            permissionDeny.addEventListener('click', () => sendPermissionResponse(false));
+            permissionDeny.addEventListener('click', () => sendPermissionResponse(false, false));
+        }
+        if (permissionAllowAll) {
+            permissionAllowAll.addEventListener('click', () => sendBatchPermissionResponse(true));
+        }
+        if (permissionDenyAll) {
+            permissionDenyAll.addEventListener('click', () => sendBatchPermissionResponse(false));
         }
 
         // Stop button handler
