@@ -1662,6 +1662,110 @@ const styles = `
         cursor: default;
     }
 
+    /* Skip button styling */
+    .tts-skip-btn {
+        background-color: rgba(33, 150, 243, 0.15);
+        color: #2196F3;
+        border: 1px solid rgba(33, 150, 243, 0.3);
+    }
+
+    .tts-skip-btn:hover {
+        background-color: rgba(33, 150, 243, 0.25);
+    }
+
+    /* TTS progress indicator */
+    .tts-progress {
+        background-color: rgba(156, 39, 176, 0.15);
+        color: #9C27B0;
+        border: 1px solid rgba(156, 39, 176, 0.3);
+        padding: 4px 8px;
+        border-radius: 4px;
+        font-size: 11px;
+        font-weight: 600;
+    }
+
+    /* Native playback indicator */
+    .tts-playing-indicator {
+        color: #4CAF50;
+        font-size: 12px;
+        padding: 4px 8px;
+        animation: pulse 1.5s ease-in-out infinite;
+    }
+
+    @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.6; }
+    }
+
+    /* Audio queue indicator in header */
+    .audio-queue-indicator {
+        display: none;
+        align-items: center;
+        gap: 8px;
+        padding: 4px 12px;
+        background-color: rgba(76, 175, 80, 0.1);
+        border: 1px solid rgba(76, 175, 80, 0.3);
+        border-radius: 6px;
+        margin-left: 12px;
+        font-size: 11px;
+    }
+
+    .audio-queue-indicator .queue-status {
+        color: #4CAF50;
+        font-weight: 500;
+    }
+
+    .audio-queue-indicator .queue-text {
+        color: var(--vscode-descriptionForeground);
+        max-width: 150px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    .audio-queue-indicator button {
+        background: transparent;
+        border: none;
+        cursor: pointer;
+        padding: 2px 4px;
+        font-size: 14px;
+        opacity: 0.8;
+        transition: opacity 0.2s;
+    }
+
+    .audio-queue-indicator button:hover {
+        opacity: 1;
+    }
+
+    .queue-skip-btn {
+        color: #2196F3;
+    }
+
+    .queue-stop-btn {
+        color: #f44336;
+    }
+
+    /* Global mute button in header */
+    .audio-mute-btn {
+        min-width: 36px;
+        padding: 4px 8px;
+        font-size: 16px;
+        transition: all 0.2s ease;
+    }
+
+    .audio-mute-btn:hover {
+        background-color: rgba(255, 152, 0, 0.15);
+    }
+
+    .audio-mute-btn.muted {
+        background-color: rgba(244, 67, 54, 0.15);
+        border-color: rgba(244, 67, 54, 0.3);
+    }
+
+    .audio-mute-btn.muted:hover {
+        background-color: rgba(244, 67, 54, 0.25);
+    }
+
     .send-btn {
         background-color: var(--vscode-button-background);
         color: var(--vscode-button-foreground);

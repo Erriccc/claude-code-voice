@@ -857,7 +857,309 @@ const getScript = (isTelemetryEnabled: boolean) => `<script>
 		// Audio playback state for mute/pause controls
 		let currentAudio = null;
 		let audioMuted = false;
+
+		// Audio queue management
 		let audioQueue = [];
+		let isProcessingQueue = false;
+		let currentQueueIndex = 0;
+
+		// Audio queue item structure: { id, audioUrl, text, nativePlayback, status: 'pending'|'playing'|'completed' }
+
+		function addToAudioQueue(audioUrl, text, nativePlayback, queueIndex, queueTotal) {
+			const item = {
+				id: 'audio_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9),
+				audioUrl: audioUrl,
+				text: text || '',
+				nativePlayback: nativePlayback || false,
+				queueIndex: queueIndex,
+				queueTotal: queueTotal,
+				status: 'pending'
+			};
+			audioQueue.push(item);
+			console.log('Audio queue: Added item', item.id, 'Queue length:', audioQueue.length);
+			updateQueueUI();
+
+			// Start processing if not already
+			if (!isProcessingQueue) {
+				processAudioQueue();
+			}
+
+			return item;
+		}
+
+		function processAudioQueue() {
+			if (isProcessingQueue) return;
+			if (audioQueue.length === 0) {
+				console.log('Audio queue: Empty, nothing to process');
+				updateQueueUI();
+				return;
+			}
+
+			// Find next pending item
+			const nextItem = audioQueue.find(item => item.status === 'pending');
+			if (!nextItem) {
+				console.log('Audio queue: No pending items');
+				isProcessingQueue = false;
+				updateQueueUI();
+				return;
+			}
+
+			isProcessingQueue = true;
+			nextItem.status = 'playing';
+			currentQueueIndex = audioQueue.indexOf(nextItem);
+			console.log('Audio queue: Processing item', nextItem.id, 'Index:', currentQueueIndex);
+			updateQueueUI();
+
+			// If native playback, just show controls (audio is playing natively)
+			if (nextItem.nativePlayback) {
+				console.log('Audio queue: Native playback, showing controls only');
+				addAudioControlsForQueueItem(nextItem, null);
+				// Native playback is handled by the extension, mark as completed after a delay
+				// The extension will send ttsStateChange when done
+				return;
+			}
+
+			// Webview playback - create and play audio
+			const audio = new Audio();
+			audio.volume = audioMuted ? 0 : 1.0;
+			currentAudio = audio;
+
+			audio.oncanplaythrough = () => {
+				console.log('Audio queue: Item ready to play', nextItem.id);
+				addAudioControlsForQueueItem(nextItem, audio);
+
+				if (audioMuted) {
+					console.log('Audio muted, not auto-playing');
+					return;
+				}
+
+				audio.play()
+					.then(() => console.log('Audio queue: Playing', nextItem.id))
+					.catch(err => console.error('Audio queue: Play failed', err));
+			};
+
+			audio.onended = () => {
+				console.log('Audio queue: Item completed', nextItem.id);
+				nextItem.status = 'completed';
+				currentAudio = null;
+				isProcessingQueue = false;
+				updateQueueUI();
+				// Process next item
+				processAudioQueue();
+			};
+
+			audio.onerror = (e) => {
+				console.error('Audio queue: Error playing', nextItem.id, e);
+				nextItem.status = 'completed';
+				currentAudio = null;
+				isProcessingQueue = false;
+				processAudioQueue();
+			};
+
+			audio.src = nextItem.audioUrl;
+			audio.load();
+		}
+
+		function skipCurrentAudio() {
+			console.log('Audio queue: Skipping current');
+			if (currentAudio) {
+				currentAudio.pause();
+				currentAudio.currentTime = 0;
+				currentAudio = null;
+			}
+
+			// Mark current as completed
+			const currentItem = audioQueue.find(item => item.status === 'playing');
+			if (currentItem) {
+				currentItem.status = 'completed';
+			}
+
+			isProcessingQueue = false;
+			processAudioQueue();
+		}
+
+		function stopAllAudio() {
+			console.log('Audio queue: Stopping all');
+			if (currentAudio) {
+				currentAudio.pause();
+				currentAudio.currentTime = 0;
+				currentAudio = null;
+			}
+
+			// Mark all as completed
+			audioQueue.forEach(item => {
+				if (item.status !== 'completed') {
+					item.status = 'completed';
+				}
+			});
+
+			isProcessingQueue = false;
+			audioQueue = [];
+			updateQueueUI();
+
+			// Notify extension to stop native playback too
+			vscode.postMessage({ type: 'stopTTS' });
+		}
+
+		function clearCompletedFromQueue() {
+			audioQueue = audioQueue.filter(item => item.status !== 'completed');
+			updateQueueUI();
+		}
+
+		function updateQueueUI() {
+			const pendingCount = audioQueue.filter(item => item.status === 'pending').length;
+			const playingItem = audioQueue.find(item => item.status === 'playing');
+
+			// Update queue indicator if it exists
+			let queueIndicator = document.getElementById('audioQueueIndicator');
+			if (!queueIndicator) {
+				// Create queue indicator in header area
+				const header = document.querySelector('.header');
+				if (header) {
+					queueIndicator = document.createElement('div');
+					queueIndicator.id = 'audioQueueIndicator';
+					queueIndicator.className = 'audio-queue-indicator';
+					header.appendChild(queueIndicator);
+				}
+			}
+
+			if (queueIndicator) {
+				if (pendingCount > 0 || playingItem) {
+					const playingText = playingItem ? (playingItem.text.substring(0, 30) + (playingItem.text.length > 30 ? '...' : '')) : '';
+					queueIndicator.innerHTML = \`
+						<span class="queue-status">🔊 \${playingItem ? 'Playing' : 'Queued'}: \${pendingCount + (playingItem ? 1 : 0)} item(s)</span>
+						\${playingText ? '<span class="queue-text">' + playingText + '</span>' : ''}
+						<button class="queue-skip-btn" onclick="window.skipCurrentAudio()" title="Skip current">⏭️</button>
+						<button class="queue-stop-btn" onclick="window.stopAllAudio()" title="Stop all">⏹️</button>
+					\`;
+					queueIndicator.style.display = 'flex';
+				} else {
+					queueIndicator.style.display = 'none';
+				}
+			}
+		}
+
+		// Expose queue functions globally
+		window.skipCurrentAudio = skipCurrentAudio;
+		window.stopAllAudio = stopAllAudio;
+
+		function addAudioControlsForQueueItem(queueItem, audioElement) {
+			const messages = document.querySelectorAll('.message.claude');
+			const lastMessage = messages[messages.length - 1];
+
+			if (!lastMessage) {
+				console.log('No Claude message found for audio controls');
+				return;
+			}
+
+			// Remove any existing controls on this message
+			const existingControls = lastMessage.querySelector('.tts-controls');
+			if (existingControls) {
+				existingControls.remove();
+			}
+
+			const controlsDiv = document.createElement('div');
+			controlsDiv.className = 'tts-controls';
+			controlsDiv.dataset.queueId = queueItem.id;
+
+			// Queue progress indicator
+			if (queueItem.queueTotal > 1) {
+				const progressSpan = document.createElement('span');
+				progressSpan.className = 'tts-progress';
+				progressSpan.textContent = \`\${(queueItem.queueIndex || 0) + 1}/\${queueItem.queueTotal}\`;
+				controlsDiv.appendChild(progressSpan);
+			}
+
+			// Play/Pause button (only useful for webview playback)
+			if (audioElement) {
+				const playBtn = document.createElement('button');
+				playBtn.className = 'tts-play-btn';
+				playBtn.innerHTML = audioElement.paused ? '▶️ Play' : '⏸️ Pause';
+				playBtn.title = 'Play/Pause audio response';
+				playBtn.onclick = () => {
+					unlockAudioContext();
+					if (audioElement.paused) {
+						audioElement.play()
+							.then(() => { playBtn.innerHTML = '⏸️ Pause'; })
+							.catch(e => console.error('Play failed:', e));
+					} else {
+						audioElement.pause();
+						playBtn.innerHTML = '▶️ Play';
+					}
+				};
+
+				audioElement.onplay = () => { playBtn.innerHTML = '⏸️ Pause'; };
+				audioElement.onpause = () => {
+					if (audioElement.currentTime < audioElement.duration) {
+						playBtn.innerHTML = '▶️ Resume';
+					}
+				};
+				audioElement.onended = () => { playBtn.innerHTML = '▶️ Play Again'; };
+
+				controlsDiv.appendChild(playBtn);
+			} else {
+				// Native playback - show "Playing..." indicator
+				const playingIndicator = document.createElement('span');
+				playingIndicator.className = 'tts-playing-indicator';
+				playingIndicator.innerHTML = '🔊 Playing (native)';
+				controlsDiv.appendChild(playingIndicator);
+			}
+
+			// Mute/Unmute button
+			const muteBtn = document.createElement('button');
+			muteBtn.className = 'tts-mute-btn';
+			muteBtn.innerHTML = audioMuted ? '🔇 Unmute' : '🔊 Mute';
+			muteBtn.title = 'Toggle audio mute';
+			muteBtn.onclick = () => {
+				audioMuted = !audioMuted;
+				if (audioElement) {
+					audioElement.volume = audioMuted ? 0 : 1.0;
+				}
+				muteBtn.innerHTML = audioMuted ? '🔇 Unmute' : '🔊 Mute';
+				updateMuteIndicator();
+			};
+			controlsDiv.appendChild(muteBtn);
+
+			// Skip button (skip to next in queue)
+			const skipBtn = document.createElement('button');
+			skipBtn.className = 'tts-skip-btn';
+			skipBtn.innerHTML = '⏭️ Skip';
+			skipBtn.title = 'Skip to next';
+			skipBtn.onclick = () => {
+				skipCurrentAudio();
+			};
+			controlsDiv.appendChild(skipBtn);
+
+			// Stop All button
+			const stopBtn = document.createElement('button');
+			stopBtn.className = 'tts-stop-btn';
+			stopBtn.innerHTML = '⏹️ Stop All';
+			stopBtn.title = 'Stop all audio';
+			stopBtn.onclick = () => {
+				stopAllAudio();
+			};
+			controlsDiv.appendChild(stopBtn);
+
+			// Insert after the message header
+			const header = lastMessage.querySelector('.message-header');
+			if (header) {
+				header.after(controlsDiv);
+			} else {
+				lastMessage.prepend(controlsDiv);
+			}
+		}
+
+		// Handle native playback completion from extension
+		function onNativePlaybackComplete() {
+			console.log('Audio queue: Native playback completed');
+			const playingItem = audioQueue.find(item => item.status === 'playing' && item.nativePlayback);
+			if (playingItem) {
+				playingItem.status = 'completed';
+			}
+			isProcessingQueue = false;
+			updateQueueUI();
+			processAudioQueue();
+		}
 
 		// Update mute indicator in UI
 		function updateMuteIndicator() {
@@ -879,12 +1181,28 @@ const getScript = (isTelemetryEnabled: boolean) => `<script>
 		function toggleGlobalMute() {
 			audioMuted = !audioMuted;
 			updateMuteIndicator();
+			updateGlobalMuteButton();
 			// Stop current audio if muting
 			if (audioMuted && currentAudio && !currentAudio.paused) {
 				currentAudio.pause();
 			}
+			// Also notify extension to stop native playback if muting
+			if (audioMuted) {
+				vscode.postMessage({ type: 'stopTTS' });
+			}
 		}
 		window.toggleGlobalMute = toggleGlobalMute;
+
+		// Update the global mute button in header
+		function updateGlobalMuteButton() {
+			const muteBtn = document.getElementById('globalMuteBtn');
+			const muteIcon = document.getElementById('globalMuteIcon');
+			if (muteBtn && muteIcon) {
+				muteIcon.textContent = audioMuted ? '🔇' : '🔊';
+				muteBtn.title = audioMuted ? 'Unmute TTS audio' : 'Mute TTS audio';
+				muteBtn.classList.toggle('muted', audioMuted);
+			}
+		}
 
 		// Unlock audio context on user gesture (voice button click)
 		function unlockAudioContext() {
@@ -2281,139 +2599,48 @@ const getScript = (isTelemetryEnabled: boolean) => `<script>
 					break;
 
 				case 'playAudio':
-					// Play TTS audio response
+					// Play TTS audio response using queue system
 					console.log('=== PLAY AUDIO RECEIVED ===');
 					console.log('Audio data length:', message.audio?.length);
 					console.log('MIME type:', message.mimeType);
-					console.log('Audio context unlocked:', audioUnlocked);
-					console.log('Audio muted:', audioMuted);
+					console.log('Native playback:', message.nativePlayback);
+					console.log('Queue index:', message.queueIndex, '/', message.queueTotal);
 
 					if (message.audio && message.mimeType) {
 						try {
 							const audioUrl = 'data:' + message.mimeType + ';base64,' + message.audio;
-							console.log('Audio URL created, length:', audioUrl.length);
+							console.log('Audio URL created, adding to queue...');
 
-							// Create audio element
-							const audio = new Audio();
-							audio.volume = audioMuted ? 0 : 1.0;
-							currentAudio = audio;
-
-							// Function to add play/pause/mute controls to the latest Claude message
-							const addAudioControls = () => {
-								const messages = document.querySelectorAll('.message.claude');
-								const lastMessage = messages[messages.length - 1];
-								if (lastMessage && !lastMessage.querySelector('.tts-controls')) {
-									const controlsDiv = document.createElement('div');
-									controlsDiv.className = 'tts-controls';
-
-									// Play/Pause button
-									const playBtn = document.createElement('button');
-									playBtn.className = 'tts-play-btn';
-									playBtn.innerHTML = '▶️ Play';
-									playBtn.title = 'Play/Pause audio response';
-									playBtn.onclick = () => {
-										unlockAudioContext();
-										if (audio.paused) {
-											audio.play()
-												.then(() => {
-													playBtn.innerHTML = '⏸️ Pause';
-												})
-												.catch(e => console.error('Play failed:', e));
-										} else {
-											audio.pause();
-											playBtn.innerHTML = '▶️ Play';
-										}
-									};
-
-									// Mute/Unmute button
-									const muteBtn = document.createElement('button');
-									muteBtn.className = 'tts-mute-btn';
-									muteBtn.innerHTML = audioMuted ? '🔇 Unmute' : '🔊 Mute';
-									muteBtn.title = 'Toggle audio mute';
-									muteBtn.onclick = () => {
-										audioMuted = !audioMuted;
-										audio.volume = audioMuted ? 0 : 1.0;
-										muteBtn.innerHTML = audioMuted ? '🔇 Unmute' : '🔊 Mute';
-										// Update global mute state indicator
-										updateMuteIndicator();
-									};
-
-									// Stop button
-									const stopBtn = document.createElement('button');
-									stopBtn.className = 'tts-stop-btn';
-									stopBtn.innerHTML = '⏹️ Stop';
-									stopBtn.title = 'Stop audio playback';
-									stopBtn.onclick = () => {
-										audio.pause();
-										audio.currentTime = 0;
-										playBtn.innerHTML = '▶️ Play';
-									};
-
-									controlsDiv.appendChild(playBtn);
-									controlsDiv.appendChild(muteBtn);
-									controlsDiv.appendChild(stopBtn);
-
-									audio.onended = () => {
-										playBtn.innerHTML = '▶️ Play Again';
-									};
-									audio.onplay = () => {
-										playBtn.innerHTML = '⏸️ Pause';
-									};
-									audio.onpause = () => {
-										if (audio.currentTime < audio.duration) {
-											playBtn.innerHTML = '▶️ Resume';
-										}
-									};
-
-									// Insert after the message header
-									const header = lastMessage.querySelector('.message-header');
-									if (header) {
-										header.after(controlsDiv);
-									} else {
-										lastMessage.prepend(controlsDiv);
-									}
-								}
-							};
-
-							// Set up event handlers before setting src
-							audio.oncanplaythrough = () => {
-								console.log('Audio can play through, attempting play...');
-								// Check if muted before auto-playing
-								if (audioMuted) {
-									console.log('Audio muted, showing controls without autoplay');
-									addAudioControls();
-									return;
-								}
-								// VS Code 1.86+ disabled UnifiedAutoplay - just try to play directly!
-								audio.play()
-									.then(() => {
-										console.log('Audio play() succeeded! (autoplay worked)');
-										addAudioControls();
-									})
-									.catch(err => {
-										console.error('Audio play() failed:', err.name, err.message);
-										// Only show play button if autoplay truly fails
-										addAudioControls();
-									});
-							};
-							audio.onplay = () => console.log('Audio onplay event fired');
-							audio.onended = () => {
-								console.log('Audio playback finished');
-								currentAudio = null;
-							};
-							audio.onerror = (e) => console.error('Audio error event:', e);
-							audio.onloadeddata = () => console.log('Audio data loaded');
-
-							// Set the source
-							audio.src = audioUrl;
-							audio.load();
-							console.log('Audio element created and loading...');
+							// Add to audio queue - queue handles playback
+							addToAudioQueue(
+								audioUrl,
+								message.text || '',
+								message.nativePlayback || false,
+								message.queueIndex,
+								message.queueTotal
+							);
 						} catch (err) {
-							console.error('Error creating audio:', err);
+							console.error('Error adding audio to queue:', err);
 						}
 					} else {
 						console.log('Missing audio or mimeType in playAudio message');
 					}
+					break;
+
+				case 'ttsStateChange':
+					// Handle TTS state changes from native playback
+					console.log('TTS State Change:', message.state);
+					if (message.state === 'idle' || message.state === 'stopped') {
+						// Native playback completed or stopped
+						onNativePlaybackComplete();
+					}
+					break;
+
+				case 'ttsComplete':
+					// All TTS playback completed
+					console.log('TTS Complete');
+					// Clear completed items from queue
+					clearCompletedFromQueue();
 					break;
 
 				case 'output':

@@ -143,53 +143,58 @@ export class VoiceBridgeServer {
     }
 
     /**
-     * Kill any existing process on the bridge port
+     * Check if the bridge port is available (without killing other processes)
+     * We don't kill other processes because that crashes other VS Code instances
      */
-    private killExistingProcess(): boolean {
+    private isPortAvailable(): boolean {
         try {
             const platform = process.platform;
             if (platform === 'darwin' || platform === 'linux') {
-                // macOS/Linux: Use lsof to find and kill process - try multiple times
-                for (let i = 0; i < 3; i++) {
-                    try {
-                        const result = execSync(`lsof -ti:${BRIDGE_PORT} 2>/dev/null || true`, { encoding: 'utf-8' });
-                        const pids = result.trim().split('\n').filter(p => p);
-                        if (pids.length === 0) {
-                            console.log(`Port ${BRIDGE_PORT} is free`);
-                            return true;
-                        }
-                        console.log(`Found processes on port ${BRIDGE_PORT}: ${pids.join(', ')}`);
-                        for (const pid of pids) {
-                            try {
-                                execSync(`kill -9 ${pid} 2>/dev/null || true`, { stdio: 'ignore' });
-                            } catch (e) {
-                                // Ignore
-                            }
-                        }
-                        // Wait a bit for the port to be released
-                        execSync('sleep 0.5', { stdio: 'ignore' });
-                    } catch (e) {
-                        // Ignore
-                    }
+                const result = execSync(`lsof -ti:${BRIDGE_PORT} 2>/dev/null || true`, { encoding: 'utf-8' });
+                const pids = result.trim().split('\n').filter(p => p);
+                if (pids.length === 0) {
+                    console.log(`Voice bridge port ${BRIDGE_PORT} is available`);
+                    return true;
                 }
+                console.log(`Voice bridge port ${BRIDGE_PORT} is in use by another VS Code instance (PID: ${pids.join(', ')})`);
+                return false;
             } else if (platform === 'win32') {
-                // Windows: Use netstat and taskkill
-                execSync(`for /f "tokens=5" %a in ('netstat -aon ^| findstr :${BRIDGE_PORT}') do taskkill /F /PID %a 2>nul`, { stdio: 'ignore', shell: 'cmd.exe' });
+                try {
+                    const result = execSync(`netstat -aon | findstr :${BRIDGE_PORT}`, { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'ignore'] });
+                    if (result.trim()) {
+                        console.log(`Voice bridge port ${BRIDGE_PORT} is in use on Windows`);
+                        return false;
+                    }
+                } catch (e) {
+                    // findstr returns error code if no match found, meaning port is free
+                    return true;
+                }
             }
-            console.log(`Cleared any existing process on port ${BRIDGE_PORT}`);
             return true;
         } catch (e) {
-            console.log(`Could not clear port ${BRIDGE_PORT}:`, e);
-            return false;
+            // If we can't check, assume available and let the server handle errors
+            console.log(`Could not check port ${BRIDGE_PORT} availability:`, e);
+            return true;
         }
     }
 
+    /** Whether this instance owns the voice bridge server */
+    private serverStarted: boolean = false;
+
     /**
      * Start the HTTP server with SSE support
+     * If port is already in use by another VS Code instance, gracefully skip
      */
     start(): void {
-        // Kill any existing process on the port first
-        this.killExistingProcess();
+        // Check if port is available first (don't kill other processes!)
+        if (!this.isPortAvailable()) {
+            console.log('Voice bridge: Another VS Code instance is running the server. Browser voice mode will use that instance.');
+            console.log('Voice bridge: This instance will work normally for webview audio and native playback.');
+            // Don't start server - another instance has it
+            // The extension will still work for webview audio and native TTS
+            this.serverStarted = false;
+            return;
+        }
 
         this.httpServer = http.createServer(async (req, res) => {
             // Enable CORS
@@ -224,36 +229,20 @@ export class VoiceBridgeServer {
             }
         });
 
-        let retryCount = 0;
-        const maxRetries = 1;
-
         this.httpServer.on('error', (err: NodeJS.ErrnoException) => {
             if (err.code === 'EADDRINUSE') {
-                if (retryCount < maxRetries) {
-                    retryCount++;
-                    console.error(`Voice bridge port ${BRIDGE_PORT} already in use. Will retry once after delay...`);
-                    // Try once more after a longer delay
-                    setTimeout(() => {
-                        try {
-                            this.httpServer?.listen(BRIDGE_PORT, '0.0.0.0');
-                        } catch (e) {
-                            console.error('Voice bridge server failed to start after retry');
-                        }
-                    }, 3000);
-                } else {
-                    console.error(`Voice bridge port ${BRIDGE_PORT} still in use. Please restart VS Code to free the port.`);
-                    vscode.window.showWarningMessage(
-                        'Voice bridge port is in use. Please restart VS Code or close other instances.',
-                        'OK'
-                    );
-                }
+                // Port became unavailable between check and listen (race condition)
+                // This is fine - another instance took it
+                console.log(`Voice bridge: Port ${BRIDGE_PORT} taken by another instance. Skipping server start.`);
+                this.serverStarted = false;
             } else {
                 console.error('Voice bridge server error:', err);
             }
         });
 
         this.httpServer.listen(BRIDGE_PORT, '0.0.0.0', () => {
-            console.log(`Voice bridge server running on port ${BRIDGE_PORT}`);
+            this.serverStarted = true;
+            console.log(`Voice bridge server started on port ${BRIDGE_PORT}`);
         });
     }
 
@@ -458,9 +447,18 @@ export class VoiceBridgeServer {
      * Check if there's an active session connected
      */
     hasActiveSession(): boolean {
+        // If we don't own the server, we can't have active sessions
+        if (!this.serverStarted) return false;
         if (!this.currentSessionCode) return false;
         const session = this.sessions.get(this.currentSessionCode);
         return !!(session && session.connected);
+    }
+
+    /**
+     * Check if this instance owns the voice bridge server
+     */
+    isServerRunning(): boolean {
+        return this.serverStarted;
     }
 
     /**
@@ -1915,7 +1913,16 @@ export class VoiceBridgeServer {
     /**
      * Open the voice bridge in browser with current session
      */
-    async openVoiceBridge(): Promise<string> {
+    async openVoiceBridge(): Promise<string | null> {
+        // Check if this instance owns the server
+        if (!this.serverStarted) {
+            vscode.window.showWarningMessage(
+                'Browser voice mode is running in another VS Code window. Please use that window for browser voice, or close it first.',
+                'OK'
+            );
+            return null;
+        }
+
         const code = this.createSession();
         // Use VS Code's API for proper Codespaces/remote URL handling
         const url = await this.getExternalUrl();

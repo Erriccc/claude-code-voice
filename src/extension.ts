@@ -332,12 +332,16 @@ class ClaudeChatProvider {
 				// Check if browser voice bridge has an active session
 				return this._voiceBridge?.hasActiveSession() ?? false;
 			},
-			onWebviewAudio: (audioBase64, mimeType) => {
-				// Send to webview for playback
+			onWebviewAudio: (audioBase64, mimeType, nativePlayback, text, queueIndex, queueTotal) => {
+				// Send to webview for playback/controls
 				this._postMessage({
 					type: 'playAudio',
 					audio: audioBase64,
-					mimeType: mimeType
+					mimeType: mimeType,
+					nativePlayback: nativePlayback ?? false,  // true = native plays audio, webview just shows controls
+					text: text,
+					queueIndex: queueIndex,
+					queueTotal: queueTotal
 				});
 			},
 			onStateChange: (state: PlaybackState) => {
@@ -411,6 +415,12 @@ class ClaudeChatProvider {
 	public async openVoiceBridgeMode(): Promise<string | null> {
 		if (this._voiceBridge) {
 			const sessionCode = await this._voiceBridge.openVoiceBridge();
+
+			// If null, another instance owns the server (warning already shown by VoiceBridgeServer)
+			if (!sessionCode) {
+				return null;
+			}
+
 			const url = await this._voiceBridge.getExternalUrl();
 
 			// Show VS Code notification with session code (easy to see)
@@ -736,6 +746,12 @@ class ClaudeChatProvider {
 				return;
 			case 'stopRequest':
 				this._stopClaudeProcess();
+				return;
+			case 'stopTTS':
+				// Stop TTS playback from webview request
+				if (this._streamingTTS) {
+					this._streamingTTS.stop();
+				}
 				return;
 			case 'getSettings':
 				this._sendCurrentSettings();

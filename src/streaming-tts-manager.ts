@@ -35,8 +35,8 @@ export interface StreamingTTSOptions {
     onBrowserAudio?: (audioBase64: string, text: string, isLast: boolean) => void;
     /** Check if browser bridge is connected (determines whether to use browser or webview) */
     isBrowserConnected?: () => boolean;
-    /** Callback to send audio to webview */
-    onWebviewAudio?: (audioBase64: string, mimeType: string) => void;
+    /** Callback to send audio to webview (with queue info for UI controls) */
+    onWebviewAudio?: (audioBase64: string, mimeType: string, nativePlayback?: boolean, text?: string, queueIndex?: number, queueTotal?: number) => void;
     /** Callback when playback state changes */
     onStateChange?: (state: PlaybackState) => void;
     /** Callback when a sentence starts playing */
@@ -210,19 +210,22 @@ export class StreamingTTSManager {
 
                 const isLast = this.currentIndex === this.queue.length - 1;
                 const browserConnected = this.options.isBrowserConnected?.() ?? false;
+                const base64 = item.audioBuffer.toString('base64');
 
                 // Determine playback target
                 if (browserConnected && this.options.onBrowserAudio) {
-                    // Browser bridge is connected - send to browser
-                    const base64 = item.audioBuffer.toString('base64');
+                    // Browser bridge is connected - send to browser for playback
                     this.options.onBrowserAudio(base64, item.text, isLast);
                 } else if (soundPlay) {
                     // Native playback available - play locally
+                    // Also send to webview for queue UI controls (but webview won't autoplay)
+                    if (this.options.onWebviewAudio) {
+                        this.options.onWebviewAudio(base64, 'audio/mp3', true, item.text, this.currentIndex, this.queue.length);
+                    }
                     await this.playNatively(item.audioBuffer);
                 } else if (this.options.onWebviewAudio) {
-                    // Send to webview
-                    const base64 = item.audioBuffer.toString('base64');
-                    this.options.onWebviewAudio(base64, 'audio/mp3');
+                    // No native playback - webview handles both playback and controls
+                    this.options.onWebviewAudio(base64, 'audio/mp3', false, item.text, this.currentIndex, this.queue.length);
                 }
 
                 item.status = 'completed';
