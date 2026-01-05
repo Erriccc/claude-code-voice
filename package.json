@@ -2,7 +2,7 @@
   "name": "claude-code-voice",
   "displayName": "Claude Code Voice",
   "description": "Voice-enabled Claude Code Chat Interface for VS Code with native mic recording and TTS",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "publisher": "Fultonmarketaistudio",
   "author": "Fulton Market AI Studio",
   "repository": {
