@@ -4,6 +4,31 @@ All notable changes to the "Claude Code Voice" extension will be documented in t
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [1.6.0] - 2026-01-05
+
+### 🎤 Major Audio Improvements - Native Audify Playback
+- **Replaced sound-play with Audify RtAudio**: Full native audio playback with real-time controls
+  - Play/Pause/Resume support during TTS playback
+  - Real-time Mute/Unmute (no longer stops audio, just silences)
+  - Volume control with instant effect
+  - Skip to next sentence in queue
+- **Auto Sample Rate Detection**: Automatically detects output device's native sample rate
+  - No more "unsupported format" errors on different hardware
+  - Resamples TTS audio (24kHz) to device's preferred rate (44.1kHz/48kHz)
+- **MP3 Decoding via mpg123-decoder**: Pure WASM decoder, no native build required
+  - Cross-platform compatible (macOS, Windows, Linux)
+  - No Python/node-gyp dependencies
+- **Improved TTS Chunking**: Reduced choppiness in spoken responses
+  - Short responses (<200 chars) play as single audio
+  - Longer responses split on sentence boundaries only
+  - Minimum 100 character chunks to avoid mid-sentence breaks
+
+### 🔧 Technical Details
+- AudioPlayer class with queue management and state callbacks
+- Linear interpolation resampling for sample rate conversion
+- Proper RtAudio chunk sizing (exact frame size required)
+- Extension sends playback state updates to webview for UI sync
+
 ## [1.2.1] - 2025-12-31
 
 ### 🐛 Bug Fixes

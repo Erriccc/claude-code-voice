@@ -14,14 +14,15 @@ Ditch the command line and experience Claude Code like never before. This extens
 
 ## ✨ **Why Choose Claude Code Chat?**
 
-🖥️ **No Terminal Required** - Beautiful chat interface replaces command-line interactions  
-⏪ **Restore Checkpoints** - Undo changes and restore code to any previous state   
-🔌 **MCP Server Support** - Complete Model Context Protocol server management   
-💾 **Conversation History** - Automatic conversation history and session management  
-🎨 **VS Code Native** - Claude Code integrated directly into VS Code with native theming and sidebar support  
-🧠 **Plan and Thinking modes** - Plan First and configurable Thinking modes for better results  
-⚡ **Smart File/Image Context and Custom Commands** - Reference any file, paste images or screenshots and create custom commands  
-🤖 **Model Selection** - Choose between Opus, Sonnet, or Default based on your needs  
+🖥️ **No Terminal Required** - Beautiful chat interface replaces command-line interactions
+🎤 **Voice Input & TTS** - Talk to Claude with native microphone and hear responses spoken back
+⏪ **Restore Checkpoints** - Undo changes and restore code to any previous state
+🔌 **MCP Server Support** - Complete Model Context Protocol server management
+💾 **Conversation History** - Automatic conversation history and session management
+🎨 **VS Code Native** - Claude Code integrated directly into VS Code with native theming and sidebar support
+🧠 **Plan and Thinking modes** - Plan First and configurable Thinking modes for better results
+⚡ **Smart File/Image Context and Custom Commands** - Reference any file, paste images or screenshots and create custom commands
+🤖 **Model Selection** - Choose between Opus, Sonnet, or Default based on your needs
 🐧 **Windows/WSL Support** - Full native Windows and WSL support
 
 ![Claude Code Chat 1 0 0](https://github.com/user-attachments/assets/5954a74c-eff7-4205-8482-6a1c9de6e102)
@@ -80,6 +81,16 @@ Ditch the command line and experience Claude Code like never before. This extens
 - **Smart Panel Management** - Automatic switching between main and sidebar views
 - **Persistent Sessions** - State maintained across panel switches
 - **Activity Bar Integration** - Quick access from VS Code's activity bar
+
+### 🎤 **Voice Input & TTS** ⭐ **NEW IN V1.6**
+- **Native Microphone Recording** - Uses Audify (RtAudio) for high-quality recording
+- **Auto Sample Rate Detection** - Works with any audio hardware
+- **Voice Activity Detection** - Auto-stops recording after silence
+- **Text-to-Speech Responses** - Hear Claude's responses spoken naturally
+- **Full Playback Controls** - Play/Pause, Mute, Volume, Skip
+- **Browser Voice Mode** - Fallback for Codespaces and VS Code Web
+- **OpenAI Whisper Integration** - Accurate speech-to-text transcription
+- **OpenAI TTS Integration** - Natural text-to-speech synthesis
 
 ### 📁 **Smart File Integration**
 - Type `@` to instantly search and reference workspace files

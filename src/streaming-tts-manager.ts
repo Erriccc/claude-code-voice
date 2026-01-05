@@ -14,13 +14,15 @@ import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
 import { VoiceService } from './voice-service';
+import { AudioPlayer, getAudioPlayer } from './audio-player';
 
-// Try to load sound-play for native playback
-let soundPlay: any = null;
-try {
-    soundPlay = require('sound-play');
-} catch (err) {
-    console.log('sound-play not available for StreamingTTSManager');
+// Get the AudioPlayer instance for native playback with controls
+let audioPlayer: AudioPlayer | null = null;
+function getPlayer(): AudioPlayer {
+    if (!audioPlayer) {
+        audioPlayer = getAudioPlayer();
+    }
+    return audioPlayer;
 }
 
 export interface TTSQueueItem {
@@ -57,7 +59,6 @@ export class StreamingTTSManager {
     private currentIndex: number = 0;
     private isPaused: boolean = false;
     private isStopped: boolean = false;
-    private currentPlayPromise: Promise<void> | null = null;
     private generatePromises: Map<string, Promise<Buffer | null>> = new Map();
 
     constructor(voiceService: VoiceService, options: StreamingTTSOptions = {}) {
@@ -66,17 +67,57 @@ export class StreamingTTSManager {
     }
 
     /**
-     * Split text into sentences for progressive TTS
+     * Split text into chunks for progressive TTS
+     * Splits on sentence boundaries but combines short sentences to avoid choppiness
      */
     private splitIntoSentences(text: string): string[] {
-        // Match sentences ending with . ! ? or newlines
-        // Keep the punctuation with the sentence
-        const sentences = text.match(/[^.!?\n]+[.!?\n]+|[^.!?\n]+$/g) || [text];
+        // For short texts, don't split at all
+        if (text.length < 200) {
+            return [text.trim()];
+        }
 
-        // Filter out empty strings and trim
-        return sentences
-            .map(s => s.trim())
-            .filter(s => s.length > 0);
+        // Split on sentence-ending punctuation followed by space
+        // This regex ensures we split after complete sentences, not mid-word
+        const sentencePattern = /(?<=[.!?])\s+(?=[A-Z])/g;
+        const rawSentences = text.split(sentencePattern);
+
+        // Combine short sentences to reduce choppiness
+        const minChunkLength = 100; // Minimum characters per chunk
+        const combined: string[] = [];
+        let currentChunk = '';
+
+        for (const sentence of rawSentences) {
+            const trimmed = sentence.trim();
+            if (!trimmed) continue;
+
+            if (currentChunk.length === 0) {
+                currentChunk = trimmed;
+            } else if (currentChunk.length + trimmed.length < minChunkLength * 2) {
+                // Combine if the result won't be too long
+                currentChunk += ' ' + trimmed;
+            } else {
+                // Current chunk is long enough, push it and start new one
+                if (currentChunk.length >= minChunkLength) {
+                    combined.push(currentChunk);
+                    currentChunk = trimmed;
+                } else {
+                    // Current chunk is short, keep combining
+                    currentChunk += ' ' + trimmed;
+                }
+            }
+        }
+
+        // Don't forget the last chunk
+        if (currentChunk.trim()) {
+            combined.push(currentChunk.trim());
+        }
+
+        // If we ended up with no chunks, return original text
+        if (combined.length === 0) {
+            return [text.trim()];
+        }
+
+        return combined;
     }
 
     /**
@@ -216,16 +257,21 @@ export class StreamingTTSManager {
                 if (browserConnected && this.options.onBrowserAudio) {
                     // Browser bridge is connected - send to browser for playback
                     this.options.onBrowserAudio(base64, item.text, isLast);
-                } else if (soundPlay) {
-                    // Native playback available - play locally
-                    // Also send to webview for queue UI controls (but webview won't autoplay)
+                } else {
+                    // Use AudioPlayer for native playback with full controls
+                    // This bypasses webview autoplay restrictions while providing
+                    // pause/resume/mute/volume controls
+                    console.log('StreamingTTS: Using AudioPlayer for native playback');
+                    console.log('StreamingTTS: Audio buffer size:', item.audioBuffer.length, 'bytes');
+                    const player = getPlayer();
+                    console.log('StreamingTTS: Got AudioPlayer, adding to queue...');
+                    await player.addToQueue(item.audioBuffer, item.text);
+                    console.log('StreamingTTS: Added to AudioPlayer queue');
+
+                    // Also notify webview for UI updates (but webview won't play audio)
                     if (this.options.onWebviewAudio) {
                         this.options.onWebviewAudio(base64, 'audio/mp3', true, item.text, this.currentIndex, this.queue.length);
                     }
-                    await this.playNatively(item.audioBuffer);
-                } else if (this.options.onWebviewAudio) {
-                    // No native playback - webview handles both playback and controls
-                    this.options.onWebviewAudio(base64, 'audio/mp3', false, item.text, this.currentIndex, this.queue.length);
                 }
 
                 item.status = 'completed';
@@ -242,38 +288,14 @@ export class StreamingTTSManager {
     }
 
     /**
-     * Play audio buffer natively using sound-play
-     */
-    private async playNatively(audioBuffer: Buffer): Promise<void> {
-        if (!soundPlay) return;
-
-        const tempFile = path.join(os.tmpdir(), `claude-tts-stream-${Date.now()}.mp3`);
-
-        try {
-            fs.writeFileSync(tempFile, audioBuffer);
-
-            this.currentPlayPromise = soundPlay.play(tempFile);
-            await this.currentPlayPromise;
-
-        } catch (err) {
-            console.error('Native playback error:', err);
-        } finally {
-            this.currentPlayPromise = null;
-            try {
-                fs.unlinkSync(tempFile);
-            } catch (e) {
-                // Ignore cleanup errors
-            }
-        }
-    }
-
-    /**
      * Pause playback
      */
     pause(): void {
         if (this.state === 'playing') {
             this.isPaused = true;
             this.setState('paused');
+            // Also pause the AudioPlayer
+            getPlayer().pause();
         }
     }
 
@@ -284,6 +306,8 @@ export class StreamingTTSManager {
         if (this.state === 'paused') {
             this.isPaused = false;
             this.setState('playing');
+            // Also resume the AudioPlayer
+            getPlayer().resume();
         }
     }
 
@@ -301,14 +325,8 @@ export class StreamingTTSManager {
             }
         }
 
-        // Wait for current playback to finish (can't interrupt native playback easily)
-        if (this.currentPlayPromise) {
-            try {
-                await this.currentPlayPromise;
-            } catch (e) {
-                // Ignore
-            }
-        }
+        // Stop the AudioPlayer (can stop immediately, unlike old sound-play)
+        getPlayer().stop();
 
         this.queue = [];
         this.currentIndex = 0;
@@ -332,7 +350,8 @@ export class StreamingTTSManager {
         if (this.currentIndex < this.queue.length - 1) {
             const item = this.queue[this.currentIndex];
             item.status = 'cancelled';
-            // The playback loop will move to next
+            // Skip in the AudioPlayer too
+            getPlayer().skip();
         }
     }
 

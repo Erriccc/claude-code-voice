@@ -1070,42 +1070,53 @@ const getScript = (isTelemetryEnabled: boolean) => `<script>
 				controlsDiv.appendChild(progressSpan);
 			}
 
-			// Play/Pause button (only useful for webview playback)
-			if (audioElement) {
-				const playBtn = document.createElement('button');
-				playBtn.className = 'tts-play-btn';
-				playBtn.innerHTML = audioElement.paused ? '▶️ Play' : '⏸️ Pause';
-				playBtn.title = 'Play/Pause audio response';
-				playBtn.onclick = () => {
+			// Play/Pause button - works for both webview and native playback
+			const playBtn = document.createElement('button');
+			playBtn.className = 'tts-play-btn';
+			playBtn.innerHTML = '⏸️ Pause';
+			playBtn.title = 'Play/Pause audio response';
+			playBtn.dataset.playing = 'true';
+			playBtn.onclick = () => {
+				if (audioElement) {
+					// Webview playback
 					unlockAudioContext();
 					if (audioElement.paused) {
 						audioElement.play()
-							.then(() => { playBtn.innerHTML = '⏸️ Pause'; })
+							.then(() => { playBtn.innerHTML = '⏸️ Pause'; playBtn.dataset.playing = 'true'; })
 							.catch(e => console.error('Play failed:', e));
 					} else {
 						audioElement.pause();
 						playBtn.innerHTML = '▶️ Play';
+						playBtn.dataset.playing = 'false';
 					}
-				};
+				} else {
+					// Native playback via extension AudioPlayer
+					if (playBtn.dataset.playing === 'true') {
+						vscode.postMessage({ type: 'pauseAudio' });
+						playBtn.innerHTML = '▶️ Resume';
+						playBtn.dataset.playing = 'false';
+					} else {
+						vscode.postMessage({ type: 'resumeAudio' });
+						playBtn.innerHTML = '⏸️ Pause';
+						playBtn.dataset.playing = 'true';
+					}
+				}
+			};
 
-				audioElement.onplay = () => { playBtn.innerHTML = '⏸️ Pause'; };
+			if (audioElement) {
+				audioElement.onplay = () => { playBtn.innerHTML = '⏸️ Pause'; playBtn.dataset.playing = 'true'; };
 				audioElement.onpause = () => {
 					if (audioElement.currentTime < audioElement.duration) {
 						playBtn.innerHTML = '▶️ Resume';
+						playBtn.dataset.playing = 'false';
 					}
 				};
-				audioElement.onended = () => { playBtn.innerHTML = '▶️ Play Again'; };
-
-				controlsDiv.appendChild(playBtn);
-			} else {
-				// Native playback - show "Playing..." indicator
-				const playingIndicator = document.createElement('span');
-				playingIndicator.className = 'tts-playing-indicator';
-				playingIndicator.innerHTML = '🔊 Playing (native)';
-				controlsDiv.appendChild(playingIndicator);
+				audioElement.onended = () => { playBtn.innerHTML = '▶️ Play Again'; playBtn.dataset.playing = 'false'; };
 			}
 
-			// Mute/Unmute button
+			controlsDiv.appendChild(playBtn);
+
+			// Mute/Unmute button - works for both webview and native playback
 			const muteBtn = document.createElement('button');
 			muteBtn.className = 'tts-mute-btn';
 			muteBtn.innerHTML = audioMuted ? '🔇 Unmute' : '🔊 Mute';
@@ -1115,6 +1126,8 @@ const getScript = (isTelemetryEnabled: boolean) => `<script>
 				if (audioElement) {
 					audioElement.volume = audioMuted ? 0 : 1.0;
 				}
+				// Also notify extension for native playback
+				vscode.postMessage({ type: 'setAudioMuted', muted: audioMuted });
 				muteBtn.innerHTML = audioMuted ? '🔇 Unmute' : '🔊 Mute';
 				updateMuteIndicator();
 			};
@@ -1127,6 +1140,8 @@ const getScript = (isTelemetryEnabled: boolean) => `<script>
 			skipBtn.title = 'Skip to next';
 			skipBtn.onclick = () => {
 				skipCurrentAudio();
+				// Also skip in native playback
+				vscode.postMessage({ type: 'skipAudio' });
 			};
 			controlsDiv.appendChild(skipBtn);
 
@@ -1137,6 +1152,7 @@ const getScript = (isTelemetryEnabled: boolean) => `<script>
 			stopBtn.title = 'Stop all audio';
 			stopBtn.onclick = () => {
 				stopAllAudio();
+				// stopAllAudio already sends stopTTS message
 			};
 			controlsDiv.appendChild(stopBtn);
 
@@ -1161,6 +1177,13 @@ const getScript = (isTelemetryEnabled: boolean) => `<script>
 			processAudioQueue();
 		}
 
+		// Update play/pause button states in audio queue controls
+		function updateAudioQueueControlsState(isPaused) {
+			document.querySelectorAll('.tts-play-btn').forEach(btn => {
+				btn.innerHTML = isPaused ? '▶️ Play' : '⏸️ Pause';
+			});
+		}
+
 		// Update mute indicator in UI
 		function updateMuteIndicator() {
 			const muteIndicator = document.getElementById('globalMuteIndicator');
@@ -1182,14 +1205,12 @@ const getScript = (isTelemetryEnabled: boolean) => `<script>
 			audioMuted = !audioMuted;
 			updateMuteIndicator();
 			updateGlobalMuteButton();
-			// Stop current audio if muting
-			if (audioMuted && currentAudio && !currentAudio.paused) {
-				currentAudio.pause();
+			// Mute/unmute webview audio element
+			if (currentAudio) {
+				currentAudio.volume = audioMuted ? 0 : 1.0;
 			}
-			// Also notify extension to stop native playback if muting
-			if (audioMuted) {
-				vscode.postMessage({ type: 'stopTTS' });
-			}
+			// Notify extension to mute/unmute native AudioPlayer
+			vscode.postMessage({ type: 'setAudioMuted', muted: audioMuted });
 		}
 		window.toggleGlobalMute = toggleGlobalMute;
 
@@ -2641,6 +2662,36 @@ const getScript = (isTelemetryEnabled: boolean) => `<script>
 					console.log('TTS Complete');
 					// Clear completed items from queue
 					clearCompletedFromQueue();
+					break;
+
+				case 'audioPlayerState':
+					// Handle native AudioPlayer state changes
+					console.log('AudioPlayer state:', message.state);
+					if (message.state === 'paused') {
+						// Update UI to show paused state
+						updateAudioQueueControlsState(true);
+					} else if (message.state === 'playing') {
+						updateAudioQueueControlsState(false);
+					} else if (message.state === 'idle' || message.state === 'stopped') {
+						onNativePlaybackComplete();
+					}
+					break;
+
+				case 'audioMuteState':
+					// Sync mute state from native AudioPlayer
+					console.log('AudioPlayer mute state:', message.muted);
+					audioMuted = message.muted;
+					updateMuteIndicator();
+					updateGlobalMuteButton();
+					if (currentAudio) {
+						currentAudio.volume = audioMuted ? 0 : 1.0;
+					}
+					break;
+
+				case 'audioQueueUpdate':
+					// Update queue display from native AudioPlayer
+					console.log('AudioPlayer queue update:', message.current, '/', message.total);
+					// Could update a queue indicator UI here if needed
 					break;
 
 				case 'output':

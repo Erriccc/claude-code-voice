@@ -9,16 +9,7 @@ import { VoiceRecorder } from './voice-recorder';
 import { VoiceBridgeServer } from './voice-bridge-server';
 import { VoiceService } from './voice-service';
 import { StreamingTTSManager, MessageQueue, PlaybackState } from './streaming-tts-manager';
-
-// Use sound-play for native audio playback (bypasses webview autoplay restrictions)
-// Wrapped in try-catch for platforms where native module fails
-let soundPlay: any = null;
-try {
-    soundPlay = require('sound-play');
-    console.log('sound-play loaded successfully');
-} catch (err) {
-    console.log('sound-play not available (native module), TTS playback disabled:', err);
-}
+import { AudioPlayer, getAudioPlayer, disposeAudioPlayer } from './audio-player';
 
 const exec = util.promisify(cp.exec);
 
@@ -288,6 +279,7 @@ class ClaudeChatProvider {
 	private _voiceBridge: VoiceBridgeServer | undefined;
 	private _streamingTTS: StreamingTTSManager | undefined;
 	private _messageQueue: MessageQueue | undefined;
+	private _audioPlayer: AudioPlayer | undefined;
 
 	constructor(
 		private readonly _extensionUri: vscode.Uri,
@@ -396,6 +388,46 @@ class ClaudeChatProvider {
 				});
 			}
 		);
+
+		// Initialize AudioPlayer for native playback with full controls
+		this._audioPlayer = getAudioPlayer({
+			onStateChange: (state, item) => {
+				// Notify webview of playback state change
+				this._postMessage({
+					type: 'audioPlayerState',
+					state: state,
+					itemId: item?.id,
+					text: item?.text
+				});
+			},
+			onQueueChange: (queue) => {
+				// Notify webview of queue changes
+				this._postMessage({
+					type: 'audioQueueUpdate',
+					queue: queue.map(item => ({
+						id: item.id,
+						text: item.text,
+						status: item.status
+					}))
+				});
+			},
+			onPlayStart: (item, index, total) => {
+				// Notify webview that a new item started playing
+				this._postMessage({
+					type: 'audioPlayStart',
+					itemId: item.id,
+					text: item.text,
+					index: index,
+					total: total
+				});
+			},
+			onComplete: () => {
+				// Notify webview that all playback is complete
+				this._postMessage({
+					type: 'audioPlayComplete'
+				});
+			}
+		});
 	}
 
 	public setVoiceRecorder(recorder: VoiceRecorder): void {
@@ -751,6 +783,71 @@ class ClaudeChatProvider {
 				// Stop TTS playback from webview request
 				if (this._streamingTTS) {
 					this._streamingTTS.stop();
+				}
+				if (this._audioPlayer) {
+					this._audioPlayer.stop();
+				}
+				return;
+			case 'pauseAudio':
+				// Pause audio playback
+				if (this._audioPlayer) {
+					this._audioPlayer.pause();
+				}
+				return;
+			case 'resumeAudio':
+				// Resume audio playback
+				if (this._audioPlayer) {
+					this._audioPlayer.resume();
+				}
+				return;
+			case 'skipAudio':
+				// Skip current audio and play next
+				if (this._audioPlayer) {
+					this._audioPlayer.skip();
+				}
+				return;
+			case 'setAudioMuted':
+				// Set mute state
+				if (this._audioPlayer) {
+					this._audioPlayer.setMuted(message.muted);
+					this._postMessage({
+						type: 'audioMuteState',
+						muted: this._audioPlayer.getMuted()
+					});
+				}
+				return;
+			case 'toggleAudioMute':
+				// Toggle mute
+				if (this._audioPlayer) {
+					const muted = this._audioPlayer.toggleMute();
+					this._postMessage({
+						type: 'audioMuteState',
+						muted: muted
+					});
+				}
+				return;
+			case 'setAudioVolume':
+				// Set volume (0-1)
+				if (this._audioPlayer && typeof message.volume === 'number') {
+					this._audioPlayer.setVolume(message.volume);
+					this._postMessage({
+						type: 'audioVolumeState',
+						volume: this._audioPlayer.getVolume()
+					});
+				}
+				return;
+			case 'getAudioState':
+				// Get current audio player state
+				if (this._audioPlayer) {
+					const status = this._audioPlayer.getQueueStatus();
+					this._postMessage({
+						type: 'audioStateResponse',
+						state: status.state,
+						current: status.current,
+						total: status.total,
+						muted: this._audioPlayer.getMuted(),
+						volume: this._audioPlayer.getVolume()
+					});
 				}
 				return;
 			case 'getSettings':
